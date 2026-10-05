@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { captainEntry, listAgentViewSources, registerAgentViewSource } from "../src/experimental/agent-view-sources.ts";
+import {
+	captainEntry,
+	listAgentViewSources,
+	registerAgentViewSource,
+	renameAgentViewRow,
+} from "../src/experimental/agent-view-sources.ts";
 
 describe("Agent View C source", () => {
 	it('tags the captain entry as origin "c" with a stable default name', () => {
@@ -35,5 +40,33 @@ describe("Agent View C source", () => {
 				.filter((s) => s.id === "c-dup")
 				.map((s) => s.label),
 		).toEqual(["captain-2"]);
+	});
+	it("renames a row through the owning source (captain is renameable)", () => {
+		const calls: Array<[string, string]> = [];
+		const off = registerAgentViewSource({
+			id: "c-rename",
+			label: "captain",
+			list: () => [captainEntry({ sessionId: "captain" })],
+			rename: (sessionId, name) => {
+				calls.push([sessionId, name]);
+				return sessionId === "captain";
+			},
+		});
+		try {
+			expect(renameAgentViewRow("captain", "helmsman")).toBe(true);
+			expect(calls).toEqual([["captain", "helmsman"]]);
+			expect(renameAgentViewRow("someone-else", "x")).toBe(false);
+		} finally {
+			off();
+		}
+	});
+
+	it("a source without rename support cannot be renamed", () => {
+		const off = registerAgentViewSource({ id: "c-norename", label: "captain", list: () => [] });
+		try {
+			expect(renameAgentViewRow("captain", "x")).toBe(false);
+		} finally {
+			off();
+		}
 	});
 });

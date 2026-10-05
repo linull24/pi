@@ -43,6 +43,11 @@ export interface AgentViewSource {
 	readonly label: string;
 	/** Contributed rows (a single entry point today). */
 	list(): readonly AgentViewRow[];
+	/**
+	 * Optional: persist a user rename for a row this source owns. Return true when the row belongs to
+	 * this source. Sources that omit it simply cannot be renamed (the UI then keeps the old name).
+	 */
+	rename?(sessionId: string, name: string): boolean;
 }
 
 const agentViewSources = new Map<string, AgentViewSource>();
@@ -61,8 +66,24 @@ export function listAgentViewSources(): readonly AgentViewSource[] {
 }
 
 /**
- * Build the single, stable C entry point (`"captain"`). A C source may use this so the row is shaped
- * correctly; the name is a default and C may rename it later.
+ * Ask the owning C source to persist a rename. Returns false when no source claims the row, so the
+ * caller can leave the name unchanged.
+ */
+export function renameAgentViewRow(sessionId: string, name: string): boolean {
+	for (const source of agentViewSources.values()) {
+		if (source.rename === undefined) continue;
+		try {
+			if (source.rename(sessionId, name) === true) return true;
+		} catch {
+			// a misbehaving source must not break renaming of the others
+		}
+	}
+	return false;
+}
+
+/**
+ * Build the single, stable entry point for our feature, "captain". A C source may use this so the row
+ * is shaped correctly; the user can rename it, so the name is only a default.
  */
 export function captainEntry(overrides: Partial<AgentViewRow> & { readonly sessionId: string }): AgentViewRow {
 	return {

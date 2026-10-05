@@ -39,6 +39,7 @@ import {
 	captainEntry,
 	listAgentViewSources,
 	registerAgentViewSource,
+	renameAgentViewRow,
 } from "./agent-view-sources.ts";
 import { type OpenClientRuntimeOptions, openClientRuntime } from "./client-runtime.ts";
 import { ExperimentalChatView, liveOf } from "./client-tui-chat.ts";
@@ -107,7 +108,7 @@ const selectTheme = {
 type SessionEntry = AgentViewRow;
 
 // Re-exported so the Agent View's C-source surface has a single import site.
-export { captainEntry, listAgentViewSources, registerAgentViewSource };
+export { captainEntry, listAgentViewSources, registerAgentViewSource, renameAgentViewRow };
 export type { AgentRowOrigin, AgentViewRow, AgentViewSource } from "./agent-view-sources.ts";
 
 function shortenPath(path: string): string {
@@ -1543,6 +1544,12 @@ export class ExperimentalClientTui implements Component {
 		const session = this.#selectedRow();
 		this.#sessionRenaming = false;
 		if (session === undefined) return;
+		if (session.origin === "c") {
+			// captain (or any C row): the owning source persists the rename.
+			renameAgentViewRow(session.sessionId, this.#sessionRenameValue);
+			this.#rebuild();
+			return;
+		}
 		try {
 			const path = join(getAgentDir(), "experimental", "sessions", session.sessionId, "meta.json");
 			const meta = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
