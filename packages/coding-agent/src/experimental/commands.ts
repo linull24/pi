@@ -64,7 +64,7 @@ async function runServerCommand(command: ServerCommand): Promise<void> {
 	}
 }
 
-async function runClientCommand(command: ClientCommand): Promise<void> {
+export async function runClientCommand(command: ClientCommand): Promise<void> {
 	if (command.prompt === undefined && process.stdin.isTTY === true && process.stdout.isTTY === true) {
 		await runClientTui(command);
 		return;
