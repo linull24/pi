@@ -142,6 +142,31 @@ function extractText(content: unknown): string {
 	return "";
 }
 
+const INTERACTIVE_TOOL_HINTS = ["ask_user_question", "askuser", "question", "request_permission", "confirm", "elicit"];
+
+/** True when an assistant entry ends on a tool call that blocks for user input. */
+function hasInteractiveToolCall(record: string): boolean {
+	try {
+		const parsed = JSON.parse(record) as { model?: Array<{ content?: unknown }> };
+		const content = parsed.model?.[0]?.content;
+		if (!Array.isArray(content)) return false;
+		return content.some((part) => {
+			if (part === null || typeof part !== "object") return false;
+			const candidate = part as { name?: unknown; toolName?: unknown };
+			const toolName =
+				typeof candidate.name === "string"
+					? candidate.name
+					: typeof candidate.toolName === "string"
+						? candidate.toolName
+						: "";
+			const lowered = toolName.toLowerCase();
+			return INTERACTIVE_TOOL_HINTS.some((hint) => lowered.includes(hint));
+		});
+	} catch {
+		return false;
+	}
+}
+
 function agentIcon(state: AgentRowState): string {
 	if (state === "working") return theme.fg("accent", "✽");
 	if (state === "needs-input") return theme.fg("warning", "✻");
@@ -649,8 +674,9 @@ export class ExperimentalClientTui implements Component {
 								"select record from entries where json_extract(record, '$.kind') = 'pi.assistant' order by id desc limit 1",
 							)
 							.get() as unknown as { record?: string } | undefined;
-						if (lastAssistant?.record !== undefined) {
-							activity = extractText(parseRecordContent(lastAssistant.record))
+						const lastAssistantRecord = lastAssistant?.record;
+						if (lastAssistantRecord !== undefined) {
+							activity = extractText(parseRecordContent(lastAssistantRecord))
 								.replace(/\s+/gu, " ")
 								.trim()
 								.slice(0, 80);
@@ -661,8 +687,12 @@ export class ExperimentalClientTui implements Component {
 							.prepare("select status, record from tasks order by id desc limit 1")
 							.get() as unknown as { status?: string; record?: string } | undefined;
 						const status = task?.status;
-						if (status === "running" || status === "pending" || status === "completing") state = "working";
-						else if (status === "waiting") state = "needs-input";
+						if (status === "pending" || status === "running" || status === "completing") state = "working";
+						else if (status === "waiting")
+							state =
+								lastAssistantRecord !== undefined && hasInteractiveToolCall(lastAssistantRecord)
+									? "needs-input"
+									: "working";
 						else if (status === "terminal")
 							state = /"(?:error|is_error)":\s*(?:"[^"]+"|true)/u.test(task?.record ?? "")
 								? "failed"
