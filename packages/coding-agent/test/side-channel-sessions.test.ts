@@ -61,6 +61,7 @@ describe("createSessionChannelOpener", () => {
 				openSpy?.(options);
 				return {
 					use: <T>(service: unknown): T => ((service as { id?: string }).id === "Q" ? questions : controller) as T,
+					ready: async () => {},
 				};
 			},
 		};

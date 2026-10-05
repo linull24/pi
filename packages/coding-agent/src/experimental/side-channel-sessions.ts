@@ -9,6 +9,7 @@
  * services, so the pieces can be tested independently.
  */
 
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { SideChannelDeps } from "./side-channel.ts";
 
 /** Channel-shaped view of one session's durable services. */
@@ -39,6 +40,7 @@ export function createSideChannelDeps(open: OpenSessionChannelServices): SideCha
 export interface SessionServiceSource {
 	open(options: { services: readonly { readonly id: string }[]; assertAccess(): void; onError(error: Error): void }): {
 		use<T>(service: unknown): T;
+		ready(context: unknown): Promise<void>;
 	};
 }
 
@@ -63,15 +65,18 @@ export function createSessionChannelOpener(
 			assertAccess: () => {},
 			onError: () => {},
 		});
+		const ready = () => services.ready(BACKGROUND_CONTEXT);
 		return {
 			hasPendingQuestion: () => readPendingQuestion(sessionId),
 			answer: async (text: string) => {
+				await ready();
 				const questions = services.use<{
 					answer(text: string): Promise<{ ok: boolean; error?: string }>;
 				}>(keys.Questions);
 				return questions.answer(text);
 			},
 			steer: async (text: string) => {
+				await ready();
 				const controller = services.use<{
 					steer(request: {
 						message: string;
