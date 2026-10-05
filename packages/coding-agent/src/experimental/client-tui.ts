@@ -92,7 +92,15 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
-type AgentRowState = "working" | "needs-input" | "needs-instructions" | "stalled" | "done" | "failed";
+type AgentRowState =
+	| "working"
+	| "needs-input"
+	| "needs-instructions"
+	| "finishing"
+	| "stalled"
+	| "done"
+	| "graved"
+	| "failed";
 
 type SessionEntry = {
 	readonly sessionId: string;
@@ -144,6 +152,7 @@ function extractText(content: unknown): string {
 
 const INTERACTIVE_TOOL_HINTS = ["ask_user_question", "askuser", "question", "request_permission", "confirm", "elicit"];
 const STALL_MS = 10 * 60 * 1000;
+const GRAVED_MS = 24 * 60 * 60 * 1000;
 
 /** True when an assistant entry ends on a tool call that blocks for user input. */
 function hasInteractiveToolCall(record: string): boolean {
@@ -172,15 +181,17 @@ function agentStateLabel(state: AgentRowState): string {
 	if (state === "working") return "working";
 	if (state === "needs-input") return "needs input";
 	if (state === "needs-instructions") return "needs instructions";
+	if (state === "finishing") return "finishing";
 	if (state === "stalled") return "stalled";
 	if (state === "done") return "done";
+	if (state === "graved") return "graved";
 	return "failed";
 }
 
 /** Fixed-width, colored state tag shown at the front of every row. */
 function agentStateTag(state: AgentRowState): string {
 	const label = agentStateLabel(state).padEnd(18);
-	if (state === "working") return theme.fg("accent", label);
+	if (state === "working" || state === "finishing") return theme.fg("accent", label);
 	if (state === "needs-input") return theme.fg("warning", label);
 	if (state === "stalled" || state === "failed") return theme.fg("error", label);
 	if (state === "done") return theme.fg("success", label);
@@ -705,7 +716,10 @@ export class ExperimentalClientTui implements Component {
 							.get() as unknown as { status?: string; record?: string } | undefined;
 						const status = task?.status;
 						const stalled = Date.now() - mtime > STALL_MS;
-						if (status === "pending" || status === "running" || status === "completing") {
+						const graved = Date.now() - mtime > GRAVED_MS;
+						if (status === "completing") {
+							state = "finishing";
+						} else if (status === "pending" || status === "running") {
 							state = stalled ? "stalled" : "working";
 						} else if (status === "waiting") {
 							state =
@@ -721,6 +735,8 @@ export class ExperimentalClientTui implements Component {
 						} else {
 							state = "needs-instructions";
 						}
+						if (meta.done === true) state = "done";
+						if (graved && (state === "needs-instructions" || state === "done")) state = "graved";
 					} finally {
 						db.close();
 					}
