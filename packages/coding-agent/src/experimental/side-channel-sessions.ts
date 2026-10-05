@@ -71,19 +71,19 @@ export function createSessionChannelOpener(
 			answer: async (text: string) => {
 				await ready();
 				const questions = services.use<{
-					answer(text: string): Promise<{ ok: boolean; error?: string }>;
+					answer(text: string, context: unknown): Promise<{ ok: boolean; error?: string }>;
 				}>(keys.Questions);
-				return questions.answer(text);
+				return questions.answer(text, BACKGROUND_CONTEXT);
 			},
 			steer: async (text: string) => {
 				await ready();
 				const controller = services.use<{
-					steer(request: {
-						message: string;
-						images: null;
-					}): Promise<{ accepted: boolean; error?: { message: string } | null }>;
+					steer(
+						request: { message: string; images: null },
+						context: unknown,
+					): Promise<{ accepted: boolean; error?: { message: string } | null }>;
 				}>(keys.AgentController);
-				const result = await controller.steer({ message: text, images: null });
+				const result = await controller.steer({ message: text, images: null }, BACKGROUND_CONTEXT);
 				return result.accepted ? { accepted: true } : { accepted: false, error: result.error?.message };
 			},
 		};

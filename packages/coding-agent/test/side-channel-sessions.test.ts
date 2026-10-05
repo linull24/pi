@@ -81,7 +81,7 @@ describe("createSessionChannelOpener", () => {
 			outcome: "answered",
 		});
 		expect(openSpy).toHaveBeenCalledWith(expect.objectContaining({ services: [{ id: "Q" }, { id: "AC" }] }));
-		expect(answer).toHaveBeenCalledWith("yes");
+		expect(answer).toHaveBeenCalledWith("yes", expect.anything());
 	});
 
 	it("steers the session with a plain prompt when no question is pending", async () => {
@@ -96,7 +96,7 @@ describe("createSessionChannelOpener", () => {
 		expect(await routeInboundChannelMessage({ channel: "im", sessionId: "s7", text: "go" }, deps)).toEqual({
 			outcome: "steered",
 		});
-		expect(steer).toHaveBeenCalledWith({ message: "go", images: null });
+		expect(steer).toHaveBeenCalledWith({ message: "go", images: null }, expect.anything());
 	});
 
 	it("surfaces a steer failure from the controller", async () => {
