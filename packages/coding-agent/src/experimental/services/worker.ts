@@ -19,6 +19,8 @@ import { AgentController } from "./agent-controller.ts";
 import { createAgentController } from "./agent-controller-provider.ts";
 import { createModelsServiceFacet } from "./models-provider.ts";
 import { SessionPlugins } from "./plugins.ts";
+import { Questions } from "./questions.ts";
+import { createQuestionsService } from "./questions-provider.ts";
 import { createTranscriptServiceFacet } from "./transcript-provider.ts";
 
 export interface SessionWorkerRuntime {
@@ -60,6 +62,7 @@ export async function createSessionWorkerServices(options: {
 		id: "@pi/agent-controller-runtime",
 		setup(env) {
 			env.provide(AgentController, createAgentController(options.harness, options.conversation));
+			env.provide(Questions, createQuestionsService(options.conversation));
 		},
 	});
 	let reloadPlugins = (): Promise<void> => Promise.reject(new Error("Session plugins are not ready"));

@@ -44,6 +44,7 @@ import type {
 } from "./services/connection.ts";
 import { PresentationPlugins } from "./services/plugins.ts";
 import { PresentationUI } from "./services/presentation-ui.ts";
+import { Questions } from "./services/questions.ts";
 import { SessionDirectory, SessionManagement, type SessionSummary } from "./services/sessions.ts";
 import { SlashCommands } from "./services/slash-commands.ts";
 import {
@@ -115,6 +116,7 @@ type SessionEntry = {
 	readonly hasUser: boolean;
 	readonly done: boolean;
 	readonly mtime: number;
+	readonly question: string | undefined;
 };
 
 function shortenPath(path: string): string {
@@ -679,6 +681,7 @@ export class ExperimentalClientTui implements Component {
 				let bytes = 0;
 				let mtime = 0;
 				let state: AgentRowState = "needs-instructions";
+				let question: string | undefined;
 				try {
 					const dbPath = join(dir, "session.sqlite");
 					const stat = statSync(dbPath);
@@ -737,6 +740,19 @@ export class ExperimentalClientTui implements Component {
 						}
 						if (meta.done === true) state = "done";
 						if (graved && (state === "needs-instructions" || state === "done")) state = "graved";
+						// A pending durable question means the session is waiting on the user.
+						const questionRow = db
+							.prepare(
+								"select r.content from document_revisions r join documents d on d.id = r.document_id where d.kind = '\"pi.question\"' order by r.seq desc limit 1",
+							)
+							.get() as unknown as { content?: string } | undefined;
+						if (questionRow?.content !== undefined) {
+							const doc = JSON.parse(questionRow.content) as { status?: string; question?: string };
+							if (doc.status === "pending" && typeof doc.question === "string") {
+								state = "needs-input";
+								question = doc.question;
+							}
+						}
 					} finally {
 						db.close();
 					}
@@ -757,6 +773,7 @@ export class ExperimentalClientTui implements Component {
 					hasUser: title.length > 0 || meta.name !== undefined,
 					done: meta.done === true,
 					mtime,
+					question,
 				});
 			} catch {
 				// not a session directory
@@ -832,7 +849,11 @@ export class ExperimentalClientTui implements Component {
 					new Text(
 						theme.fg(
 							"muted",
-							`── peek ──\n  ${session.activity || session.title || "(no output yet)"}\n  cwd: ${session.cwd || "(unknown)"} · entries: ${session.entries} · ${formatBytes(session.bytes)}`,
+							`── peek ──\n${
+								session.question !== undefined
+									? `  ❓ ${session.question}\n  answer with /reply <answer>\n`
+									: ""
+							}  ${session.activity || session.title || "(no output yet)"}\n  cwd: ${session.cwd || "(unknown)"} · entries: ${session.entries} · ${formatBytes(session.bytes)}`,
 						),
 						1,
 						1,
@@ -849,7 +870,7 @@ export class ExperimentalClientTui implements Component {
 			new Text(
 				theme.fg(
 					"muted",
-					"Ctrl+A all/this · ↑/↓ move · Space peek · Enter attach · type to dispatch · /done · Ctrl+X stop · Esc exit",
+					"Ctrl+A all/this · Space peek · Enter attach · type to dispatch · /reply <answer> · /done · Ctrl+X stop · Esc exit",
 				),
 				1,
 				1,
@@ -888,6 +909,10 @@ export class ExperimentalClientTui implements Component {
 				this.#markDone(this.#visibleSessions()[this.#sessionIndex]);
 				return;
 			}
+			if (text.startsWith("/reply ")) {
+				void this.#answerQuestion(this.#visibleSessions()[this.#sessionIndex]?.sessionId, text.slice(7).trim());
+				return;
+			}
 			if (text.length > 0) {
 				void this.#dispatchAgent(text);
 				return;
@@ -911,7 +936,8 @@ export class ExperimentalClientTui implements Component {
 			void this.#stopAgent();
 			return;
 		} else if (data === " ") {
-			this.#sessionPreview = !this.#sessionPreview;
+			if (this.#agentDispatch.length === 0) this.#sessionPreview = !this.#sessionPreview;
+			else this.#agentDispatch += " ";
 		} else if (data === "\u007f") {
 			this.#agentDispatch = this.#agentDispatch.slice(0, -1);
 		} else if (data.length === 1 && data >= " ") {
@@ -1098,6 +1124,50 @@ export class ExperimentalClientTui implements Component {
 			} catch {
 				// listener failures must not break the UI
 			}
+		}
+		this.#sessionItems = this.#listSessions();
+		this.#rebuild();
+	}
+
+	/** Answer the selected session's durable pending question. */
+	async #answerQuestion(sessionId: string | undefined, answer: string): Promise<void> {
+		this.#agentDispatch = "";
+		if (sessionId === undefined || answer.length === 0) {
+			this.#rebuild();
+			return;
+		}
+		this.#status = "Answering…";
+		this.#rebuild();
+		try {
+			const server = this.#servers[0];
+			if (server === undefined) throw new Error("no server available");
+			const serverServices = server.server.open({
+				services: [SessionManagement],
+				assertAccess() {},
+				onError() {},
+			});
+			const sessionServices = server.session.open({
+				services: [Questions],
+				assertAccess() {},
+				onError() {},
+			});
+			try {
+				await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
+				const management = serverServices.use(SessionManagement);
+				await management.attach(sessionId, BACKGROUND_CONTEXT);
+				await server.session.whenAttached(sessionId, BACKGROUND_CONTEXT);
+				const questions = sessionServices.use(Questions);
+				const result = await questions.answer(answer, BACKGROUND_CONTEXT);
+				if (!result.ok) throw new Error(result.error ?? "answer rejected");
+			} finally {
+				await Promise.allSettled([
+					serverServices.dispose(BACKGROUND_CONTEXT),
+					sessionServices.dispose(BACKGROUND_CONTEXT),
+				]);
+			}
+			this.#status = "";
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
 		}
 		this.#sessionItems = this.#listSessions();
 		this.#rebuild();
