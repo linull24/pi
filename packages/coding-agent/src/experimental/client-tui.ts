@@ -43,6 +43,7 @@ import type {
 	SessionAttachmentState,
 	SessionServiceSource,
 } from "./services/connection.ts";
+import { Goals } from "./services/goals.ts";
 import { PresentationPlugins } from "./services/plugins.ts";
 import { PresentationUI } from "./services/presentation-ui.ts";
 import { Questions } from "./services/questions.ts";
@@ -270,6 +271,7 @@ export class ExperimentalClientTui implements Component {
 	#needsInput = 0;
 	#agentPollTimer: ReturnType<typeof setInterval> | undefined;
 	#agentStates = new Map<string, AgentRowState>();
+	#goal: string | undefined;
 	#documentHidden = false;
 
 	private constructor(
@@ -286,7 +288,14 @@ export class ExperimentalClientTui implements Component {
 		this.#servers = servers;
 		setKeybindings(this.#keybindings);
 		this.#chatInput = new CustomEditor(ui, getEditorTheme(), this.#keybindings, { paddingX: 1 });
-		this.#chatInput.onSubmit = (message) => void this.#runPrompt(message);
+		this.#chatInput.onSubmit = (message) => {
+			const text = message.trim();
+			if (text === "/goal" || text.startsWith("/goal ")) {
+				void this.#runGoalCommand(text.slice(5));
+				return;
+			}
+			void this.#runPrompt(message);
+		};
 		this.#chatInput.onEscape = () => this.#interrupt();
 		this.#chatInput.onCtrlD = finish;
 		this.#chatInput.onAction("app.clear", finish);
@@ -515,6 +524,7 @@ export class ExperimentalClientTui implements Component {
 		this.#screen = "chat";
 		this.#status = "";
 		this.#rebuild();
+		void this.#refreshGoal();
 	}
 
 	async #close(): Promise<void> {
@@ -1115,6 +1125,62 @@ export class ExperimentalClientTui implements Component {
 	}
 
 	/** Answer the selected session's durable pending question. */
+	/** Set, clear, or read the session's durable goal (pi.goal). */
+	async #runGoalCommand(args: string): Promise<void> {
+		const text = args.trim();
+		this.#status = "";
+		try {
+			const server = this.#servers[0];
+			if (server === undefined) throw new Error("no server available");
+			const services = server.session.open({ services: [Goals], assertAccess() {}, onError() {} });
+			try {
+				await services.ready(BACKGROUND_CONTEXT);
+				const goals = services.use(Goals);
+				const lower = text.toLowerCase();
+				if (["clear", "stop", "off", "reset", "none", "cancel"].includes(lower)) {
+					await goals.clear(BACKGROUND_CONTEXT);
+					this.#goal = undefined;
+					this.#status = "goal cleared";
+				} else if (text.length === 0) {
+					const state = await goals.status(BACKGROUND_CONTEXT);
+					this.#goal = state.active ? state.condition : undefined;
+					this.#status = state.active
+						? `◎ goal: ${state.condition} (turn ${state.verdicts})`
+						: state.condition.length > 0 && state.outcome.length > 0
+							? `goal ${state.outcome}: ${state.condition}`
+							: "No goal set";
+				} else {
+					await goals.set(text, BACKGROUND_CONTEXT);
+					this.#goal = text;
+					this.#status = `◎ goal set: ${text}`;
+				}
+			} finally {
+				await services.dispose(BACKGROUND_CONTEXT);
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+		this.#rebuild();
+	}
+
+	async #refreshGoal(): Promise<void> {
+		try {
+			const server = this.#servers[0];
+			if (server === undefined) return;
+			const services = server.session.open({ services: [Goals], assertAccess() {}, onError() {} });
+			try {
+				await services.ready(BACKGROUND_CONTEXT);
+				const state = await services.use(Goals).status(BACKGROUND_CONTEXT);
+				this.#goal = state.active ? state.condition : undefined;
+			} finally {
+				await services.dispose(BACKGROUND_CONTEXT);
+			}
+			this.#rebuild();
+		} catch {
+			// goal display is best-effort
+		}
+	}
+
 	async #answerQuestion(sessionId: string | undefined, answer: string): Promise<void> {
 		this.#agentDispatch = "";
 		if (sessionId === undefined || answer.length === 0) {
@@ -1394,7 +1460,8 @@ export class ExperimentalClientTui implements Component {
 		const agent = (view.docs["pi.agent"] ?? {}) as AgentState;
 		const model = agent.model === undefined ? "no model" : `${agent.model.provider}/${agent.model.modelId}`;
 		const agentsHint = this.#needsInput > 0 ? `← ${this.#needsInput} agents` : "← agents";
-		return `${model} · thinking:${agent.thinkingLevel ?? "off"} · ${view.entries.length} entries · ${agentsHint} · /model · /thinking · /compact · /reload`;
+		const goalHint = this.#goal === undefined ? "" : ` · ◎ goal: ${this.#goal.slice(0, 40)}`;
+		return `${model} · thinking:${agent.thinkingLevel ?? "off"} · ${view.entries.length} entries · ${agentsHint}${goalHint} · /model · /thinking · /goal`;
 	}
 }
 
