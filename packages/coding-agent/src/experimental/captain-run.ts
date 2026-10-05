@@ -61,9 +61,9 @@ export function readSessionState(sessionId: string, agentDir?: string): string {
 	const db = new DatabaseSync(dbPath, { readOnly: true });
 	try {
 		let state = "needs-instructions";
-		const task = db.prepare("select status, record from tasks order by id desc limit 1").get() as unknown as
-			| { status?: string; record?: string }
-			| undefined;
+		const task = db
+			.prepare("select status, record from tasks where kind = 'pi.generation' order by id desc limit 1")
+			.get() as unknown as { status?: string; record?: string } | undefined;
 		if (task?.status === "completing") state = "finishing";
 		else if (task?.status === "pending" || task?.status === "running" || task?.status === "waiting")
 			state = "working";

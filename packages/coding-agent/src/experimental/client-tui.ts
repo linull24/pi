@@ -703,7 +703,7 @@ export class ExperimentalClientTui implements Component {
 						const countRow = db.prepare("select count(*) as c from entries").get() as unknown as { c?: number };
 						entries = countRow?.c ?? 0;
 						const task = db
-							.prepare("select status, record from tasks order by id desc limit 1")
+							.prepare("select status, record from tasks where kind = 'pi.generation' order by id desc limit 1")
 							.get() as unknown as { status?: string; record?: string } | undefined;
 						const status = task?.status;
 						// State is derived only from durable session state: the task record and the pi.question document.
