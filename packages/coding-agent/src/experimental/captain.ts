@@ -14,7 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createQqBotAdapter } from "./channels/qq.ts";
-import { openClientRuntime } from "./client-runtime.ts";
+import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
 import { AgentController } from "./services/agent-controller.ts";
 import { Questions } from "./services/questions.ts";
 import {
@@ -157,7 +157,10 @@ export async function runCaptain(
 	const runtime = await openClientRuntime({ command: "client" }, { directory: options.directory });
 	const server = runtime.servers[0];
 	if (server === undefined) throw new Error("captain: no daemon server reachable");
-	await server.session.whenAttached(sessionId, BACKGROUND_CONTEXT);
+	// Attaching is what makes the session the client's current attachment; `whenAttached` alone only
+	// waits for an attachment that was already requested.
+	const activated = await activateBuiltinClientServices(server);
+	await activated.management.attach(sessionId, BACKGROUND_CONTEXT);
 
 	const opener = createSessionChannelOpener(
 		{ open: (openOptions) => server.session.open(openOptions) },
