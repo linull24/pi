@@ -662,6 +662,20 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
 	}
 
+	/**
+	 * Wheel over a focused overlay whose component does not implement `handleMouse` (e.g. a modal
+	 * list or dialog): translate the wheel into Up/Down key input so it scrolls its content
+	 * instead of being swallowed. `lines` is the per-notch scroll amount from the wheel parser.
+	 */
+	private forwardWheelToOverlayComponent(direction: number, lines: number): void {
+		const target = this.getFocusedComponent();
+		if (!target?.handleInput) return;
+		const key = direction < 0 ? "\x1b[A" : "\x1b[B";
+		const count = Math.min(3, Math.max(1, Math.abs(lines)));
+		for (let i = 0; i < count; i++) target.handleInput(key);
+		this.requestRender();
+	}
+
 	private clearComponentMouseGesture(): void {
 		this.mouseCapture = undefined;
 		this.mousePressTarget = undefined;
@@ -707,7 +721,14 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				if (this.applyMouseDispatchResult(event, result)) this.requestRender();
 				return { consume: true };
 			}
-			if (this.shouldDeferViewportInputToOverlay()) return undefined;
+			// Cursor inside a focused overlay that has no mouse handling (e.g. a modal dialog):
+			// forward the wheel to it as Up/Down keys instead of dropping it.
+			if (overlay.hit && this.isOverlayFocused()) {
+				this.forwardWheelToOverlayComponent(wheelEvent.direction, lines);
+				return { consume: true };
+			}
+			// Cursor outside every overlay: the wheel scrolls the conversation even while a modal
+			// is focused, so the transcript behind the dialog stays readable.
 			this.routeWheel(wheelEvent, wheelDelta);
 			return { consume: true };
 		}

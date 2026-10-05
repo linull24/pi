@@ -1981,12 +1981,16 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.strictEqual(overlay.focused, true);
 
-		const wheel = "\x1b[<64;10;3M";
-		const keys = ["\x1b[5~", "\x1b[6~", "\x1bOH", "\x1bOF", wheel];
+		// Viewport keys pass through unchanged; the wheel over a keyboard-only focused overlay is
+		// mapped to Up/Down key input (the overlay has no mouse handling) and never moves the viewport.
+		const keys = ["\x1b[5~", "\x1b[6~", "\x1bOH", "\x1bOF"];
 		for (const key of keys) terminal.sendInput(key);
+		terminal.sendInput("\x1b[<64;10;3M");
 		await terminal.waitForRender();
 
-		assert.deepStrictEqual(overlay.inputs, keys);
+		assert.deepStrictEqual(overlay.inputs.slice(0, keys.length), keys);
+		assert.ok(overlay.inputs.length > keys.length, "the wheel should be delivered as key input");
+		assert.ok(overlay.inputs.slice(keys.length).every((key) => key === "\x1b[A"));
 		assert.strictEqual(tui.viewportTop, topBefore);
 
 		handle.hide();
