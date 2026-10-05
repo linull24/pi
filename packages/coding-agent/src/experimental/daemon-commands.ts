@@ -70,7 +70,7 @@ async function parseResume(rest: string[]): Promise<ClientCommand> {
  */
 export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 	const command = args[0];
-	if (command !== "agents" && command !== "resume" && command !== "queue" && command !== "--resume") {
+	if (command !== "agents" && command !== "resume" && command !== "queue") {
 		return false;
 	}
 
@@ -98,7 +98,7 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 			return true;
 		}
 
-		// resume / --resume
+		// resume (subcommand; `--resume` is left to the native session picker)
 		await runClientCommand(await parseResume(args.slice(1)));
 		return true;
 	} catch (error) {
