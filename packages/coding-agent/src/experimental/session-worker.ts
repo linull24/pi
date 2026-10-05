@@ -28,6 +28,7 @@ import {
 	ExecutionEnvs,
 	findInitialAgentModel,
 } from "./durable/harness-setup.ts";
+import { RequestInput } from "./durable/request-input.ts";
 import { Subagent } from "./durable/subagent.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
@@ -785,6 +786,7 @@ async function createCodingAgentHarness(
 	try {
 		const registry = createCodingRegistry(settingsManager, cwd);
 		registry.install(Subagent);
+		registry.install(RequestInput);
 		await installExtensionTools(registry, settingsManager, cwd, modelRuntime);
 		harness = await Harness.open(
 			await openNodeSqliteStorage(databasePath),
