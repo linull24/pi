@@ -393,7 +393,7 @@ async function startServerBackend(
 		return metadata;
 	};
 	const createSession = (createOptions: SessionCreateOptions): Promise<SessionCatalogMetadata> =>
-		createCatalogSession(sessionDir, { ...createOptions, cwd: process.cwd() });
+		createCatalogSession(sessionDir, { ...createOptions, cwd: createOptions.cwd ?? process.cwd() });
 	const summarize = (metadata: SessionCatalogMetadata): SessionSummary => ({
 		serverId,
 		sessionId: metadata.id,

@@ -1,5 +1,6 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
 	combineFacetLoaders,
@@ -907,6 +908,27 @@ export class ExperimentalClientTui implements Component {
 		this.#rebuild();
 	}
 
+	/** Create a git worktree for an isolated background agent. Returns undefined when not applicable. */
+	async #prepareWorktree(): Promise<string | undefined> {
+		if (process.env.PI_NO_WORKTREE === "1") return undefined;
+		const top = await new Promise<string>((done) => {
+			execFile("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd() }, (error, stdout) =>
+				done(error ? "" : stdout.trim()),
+			);
+		});
+		if (top.length === 0) return undefined;
+		const worktree = join(top, ".pi", "worktrees", `agent-${Date.now().toString(36)}`);
+		try {
+			mkdirSync(dirname(worktree), { recursive: true });
+		} catch {
+			return undefined;
+		}
+		const ok = await new Promise<boolean>((done) => {
+			execFile("git", ["worktree", "add", "--detach", worktree], { cwd: top }, (error) => done(error === null));
+		});
+		return ok ? worktree : undefined;
+	}
+
 	/** Dispatch a new background agent: create a Session and send the prompt. */
 	async #dispatchAgent(prompt: string): Promise<void> {
 		this.#status = "Dispatching…";
@@ -936,7 +958,12 @@ export class ExperimentalClientTui implements Component {
 				const management = serverServices.use(SessionManagement);
 				const plugins = serverServices.use(PresentationPlugins);
 				const controller = sessionServices.use(AgentController);
-				const summary = await management.create({}, BACKGROUND_CONTEXT);
+				// Isolate a parallel agent's edits in a git worktree when possible.
+				const worktree = await this.#prepareWorktree();
+				const summary = await management.create(
+					worktree === undefined ? {} : { cwd: worktree },
+					BACKGROUND_CONTEXT,
+				);
 				await plugins.prepareSession({ sessionId: summary.sessionId, packagePaths: null }, BACKGROUND_CONTEXT);
 				await management.attach(summary.sessionId, BACKGROUND_CONTEXT);
 				await server.session.whenAttached(summary.sessionId, BACKGROUND_CONTEXT);

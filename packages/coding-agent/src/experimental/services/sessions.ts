@@ -12,6 +12,8 @@ export interface SessionSummary extends SessionAddress {
 
 export interface SessionCreateOptions {
 	id?: string;
+	/** Working directory for the new session. Defaults to the server's cwd. Used for worktree isolation. */
+	cwd?: string;
 }
 
 export interface SessionDirectoryState {
