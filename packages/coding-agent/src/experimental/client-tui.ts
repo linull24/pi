@@ -262,6 +262,8 @@ export class ExperimentalClientTui implements Component {
 	#sessionIndex = 0;
 	#sessionQuery = "";
 	#sessionAll = false;
+	/** True while the Captain (C entry point) row has the cursor in the Agent View. */
+	#captainSelected = false;
 	#sessionPreview = false;
 	#sessionRenaming = false;
 	#sessionRenameValue = "";
@@ -764,6 +766,7 @@ export class ExperimentalClientTui implements Component {
 		this.#sessionItems = this.#listSessions();
 		this.#sessionQuery = "";
 		this.#sessionAll = false;
+		this.#captainSelected = false;
 		this.#sessionIndex = 0;
 		this.#sessionPreview = false;
 		this.#sessionRenaming = false;
@@ -773,10 +776,14 @@ export class ExperimentalClientTui implements Component {
 		void this.#pruneEmptySessions();
 	}
 
-	/** Sessions passing the current-directory / query filters, newest first, then C rows. */
+	/** pi (A) sessions passing the current-directory / query filters, newest first. */
 	#visibleSessions(): SessionEntry[] {
-		// pi (A) rows on top, activity-time sorted; C rows follow and render below the divider.
-		return [...this.#filterPiSessions(), ...this.#listCEntries()];
+		return this.#filterPiSessions();
+	}
+
+	/** The single, stable C entry point ("captain"), when a C source is registered. */
+	#captainRow(): SessionEntry | undefined {
+		return this.#listCEntries()[0];
 	}
 
 	/** Apply the all/this and query filters to pi's own sessions. */
@@ -826,20 +833,30 @@ export class ExperimentalClientTui implements Component {
 		const visible = this.#visibleSessions();
 		const scoped = this.#sessionItems.filter((session) => this.#sessionAll || session.cwd === process.cwd());
 		const needsInput = scoped.filter((session) => session.state === "needs-input").length;
-		const header =
-			theme.fg("accent", "Agents") +
-			theme.fg("muted", `  ${scoped.length} session${scoped.length === 1 ? "" : "s"}`) +
-			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "") +
-			theme.fg("muted", ` · most active first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
-		container.addChild(new Text(header, 1, 1));
+		const divider = theme.fg("muted", "─".repeat(60));
+
+		// 1. Captain — the single, stable C entry point, on top.
+		const captain = this.#captainRow();
+		if (captain !== undefined) {
+			const name = this.#sessionName(captain);
+			const prefix = this.#captainSelected ? `${theme.fg("accent", "❯")} ` : "  ";
+			const label = this.#captainSelected ? theme.bold(name) : name;
+			container.addChild(new Text(`${prefix}${agentStateTag(captain.state)} ${label}`, 1, 0));
+		}
+
+		// 2. Divider, then the search box, then a second divider.
+		container.addChild(new Text(divider, 1, 1));
+		const queryLine = this.#sessionQuery.length > 0 ? this.#sessionQuery : theme.fg("muted", "Search…");
+		container.addChild(new Text(`${theme.fg("accent", "⌕ ")}${queryLine}`, 1, 0));
+		container.addChild(new Text(divider, 1, 1));
+
+		// 3. The list: sessions sorted by activity time, scrollable all the way to the bottom.
+		const scope =
+			theme.fg("muted", `most active first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`) +
+			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "");
+		container.addChild(new Text(scope, 1, 0));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
-		const dividerLabel = listAgentViewSources()[0]?.label ?? "captain";
-		let dividerDrawn = false;
-		visible.slice(0, 20).forEach((session, index) => {
-			if (session.origin === "c" && !dividerDrawn) {
-				dividerDrawn = true;
-				container.addChild(new Text(theme.fg("muted", `── ${dividerLabel} ──`), 1, 1));
-			}
+		visible.forEach((session, index) => {
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
 			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
@@ -857,7 +874,7 @@ export class ExperimentalClientTui implements Component {
 			container.addChild(new Text(theme.fg("accent", `Rename: ${this.#sessionRenameValue}▏`), 1, 1));
 		}
 		if (this.#sessionPreview) {
-			const session = visible[this.#sessionIndex];
+			const session = this.#selectedRow();
 			if (session !== undefined) {
 				container.addChild(
 					new Text(
@@ -909,22 +926,34 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		if (data === "\u001b[A" || data === "\u001bOA") {
-			const count = Math.max(this.#visibleSessions().length, 1);
-			this.#sessionIndex = (this.#sessionIndex - 1 + count) % count;
+			const count = this.#visibleSessions().length;
+			if (this.#captainSelected) {
+				this.#captainSelected = false;
+				this.#sessionIndex = Math.max(0, count - 1);
+			} else if (this.#sessionIndex === 0 && this.#captainRow() !== undefined) {
+				this.#captainSelected = true;
+			} else {
+				this.#sessionIndex = count === 0 ? 0 : (this.#sessionIndex - 1 + count) % count;
+			}
 		} else if (data === "\u001b[B" || data === "\u001bOB") {
-			const count = Math.max(this.#visibleSessions().length, 1);
-			this.#sessionIndex = (this.#sessionIndex + 1) % count;
+			const count = this.#visibleSessions().length;
+			if (this.#captainSelected) {
+				this.#captainSelected = false;
+				this.#sessionIndex = 0;
+			} else {
+				this.#sessionIndex = count === 0 ? 0 : (this.#sessionIndex + 1) % count;
+			}
 		} else if (data === "\u001b[C" || data === "\u001bOC") {
 			void this.#confirmSession();
 			return;
 		} else if (data === "\r" || data === "\n") {
 			const text = this.#agentDispatch.trim();
 			if (text === "/done") {
-				this.#markDone(this.#visibleSessions()[this.#sessionIndex]);
+				this.#markDone(this.#selectedRow());
 				return;
 			}
 			if (text.startsWith("/reply ")) {
-				void this.#answerQuestion(this.#visibleSessions()[this.#sessionIndex]?.sessionId, text.slice(7).trim());
+				void this.#answerQuestion(this.#selectedRow()?.sessionId, text.slice(7).trim());
 				return;
 			}
 			if (text.length > 0) {
@@ -941,7 +970,7 @@ export class ExperimentalClientTui implements Component {
 			this.#sessionAll = !this.#sessionAll;
 			this.#sessionIndex = 0;
 		} else if (data === "\u0012") {
-			const session = this.#visibleSessions()[this.#sessionIndex];
+			const session = this.#selectedRow();
 			if (session !== undefined) {
 				this.#sessionRenaming = true;
 				this.#sessionRenameValue = session.name ?? session.title;
@@ -1050,7 +1079,7 @@ export class ExperimentalClientTui implements Component {
 
 	/** Stop the selected background agent (abort its active run). */
 	async #stopAgent(): Promise<void> {
-		const session = this.#visibleSessions()[this.#sessionIndex];
+		const session = this.#selectedRow();
 		if (session === undefined) return;
 		this.#status = `Stopping ${session.sessionId.slice(0, 8)}…`;
 		this.#rebuild();
@@ -1459,8 +1488,14 @@ export class ExperimentalClientTui implements Component {
 		this.#rebuild();
 	}
 
+	/** The row under the cursor: the Captain entry when selected, else the indexed pi session. */
+	#selectedRow(): SessionEntry | undefined {
+		if (this.#captainSelected) return this.#captainRow();
+		return this.#visibleSessions()[this.#sessionIndex];
+	}
+
 	#saveSessionName(): void {
-		const session = this.#visibleSessions()[this.#sessionIndex];
+		const session = this.#selectedRow();
 		this.#sessionRenaming = false;
 		if (session === undefined) return;
 		try {
@@ -1475,7 +1510,7 @@ export class ExperimentalClientTui implements Component {
 	}
 
 	async #confirmSession(): Promise<void> {
-		const target = this.#visibleSessions()[this.#sessionIndex];
+		const target = this.#selectedRow();
 		this.#screen = "chat";
 		if (target === undefined || target.sessionId === this.#sessionId) {
 			this.#rebuild();
