@@ -1379,7 +1379,9 @@ export class ExperimentalClientTui implements Component {
 				"--mode",
 				"json",
 				"-p",
-				"--no-session",
+				// Reuse the same supervisor session as goal supervision.
+				"--session",
+				join(getAgentDir(), "supervisor", "session.jsonl"),
 				"--no-extensions",
 				"--no-tools",
 				"--model",
