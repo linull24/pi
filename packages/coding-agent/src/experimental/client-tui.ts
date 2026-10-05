@@ -930,7 +930,7 @@ export class ExperimentalClientTui implements Component {
 			new Text(
 				theme.fg(
 					"muted",
-					"type to search · /dispatch <task> · Ctrl+A all/this · Space peek · Enter attach · /reply · /done · Ctrl+X stop · Esc exit",
+					"type to search · /dispatch <task> · Ctrl+A this folder / whole machine · Space peek · Enter attach · /reply · /done · Ctrl+X stop · Esc exit",
 				),
 				1,
 				1,
