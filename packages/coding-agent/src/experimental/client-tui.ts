@@ -33,6 +33,13 @@ import { CustomEditor } from "../modes/interactive/components/custom-editor.ts";
 import { getEditorTheme, setRegisteredThemes, stopThemeWatcher, theme } from "../modes/interactive/theme/theme.ts";
 import { InteractiveThemeController } from "../modes/interactive/theme/theme-controller.ts";
 import { createInteractiveTui } from "../modes/interactive/tui-renderer.ts";
+import {
+	type AgentRowState,
+	type AgentViewRow,
+	captainEntry,
+	listAgentViewSources,
+	registerAgentViewSource,
+} from "./agent-view-sources.ts";
 import { type OpenClientRuntimeOptions, openClientRuntime } from "./client-runtime.ts";
 import { ExperimentalChatView, liveOf } from "./client-tui-chat.ts";
 import { emitAgentNotification } from "./notify.ts";
@@ -96,23 +103,12 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
-type AgentRowState = "working" | "needs-input" | "needs-instructions" | "finishing" | "done" | "failed";
+/** Agent View rows use the shared row shape; pi rows are built locally, C rows come from sources. */
+type SessionEntry = AgentViewRow;
 
-type SessionEntry = {
-	readonly sessionId: string;
-	readonly createdAt: number;
-	readonly lastActivityAt: number;
-	readonly cwd: string;
-	readonly title: string;
-	readonly activity: string;
-	readonly state: AgentRowState;
-	readonly entries: number;
-	readonly bytes: number;
-	readonly name: string | undefined;
-	readonly hasUser: boolean;
-	readonly done: boolean;
-	readonly question: string | undefined;
-};
+// Re-exported so the Agent View's C-source surface has a single import site.
+export { captainEntry, listAgentViewSources, registerAgentViewSource };
+export type { AgentRowOrigin, AgentViewRow, AgentViewSource } from "./agent-view-sources.ts";
 
 function shortenPath(path: string): string {
 	const home = process.env.HOME;
@@ -754,6 +750,7 @@ export class ExperimentalClientTui implements Component {
 					hasUser: title.length > 0 || meta.name !== undefined,
 					done: meta.done === true,
 					question,
+					origin: "pi",
 				});
 			} catch {
 				// not a session directory
@@ -776,24 +773,52 @@ export class ExperimentalClientTui implements Component {
 		void this.#pruneEmptySessions();
 	}
 
-	/** Sessions passing the current-directory / query filters, newest first. */
+	/** Sessions passing the current-directory / query filters, newest first, then C rows. */
 	#visibleSessions(): SessionEntry[] {
+		// pi (A) rows on top, activity-time sorted; C rows follow and render below the divider.
+		return [...this.#filterPiSessions(), ...this.#listCEntries()];
+	}
+
+	/** Apply the all/this and query filters to pi's own sessions. */
+	#filterPiSessions(): SessionEntry[] {
 		const query = this.#sessionQuery.toLowerCase();
 		return this.#sessionItems
 			.filter((session) => this.#sessionAll || session.cwd === process.cwd())
-			.filter(
-				(session) =>
-					query.length === 0 ||
-					session.sessionId.toLowerCase().includes(query) ||
-					session.cwd.toLowerCase().includes(query) ||
-					session.title.toLowerCase().includes(query) ||
-					(session.name?.toLowerCase().includes(query) ?? false),
-			)
+			.filter((session) => this.#matchesQuery(session, query))
 			.filter((session) => session.hasUser || session.sessionId === this.#sessionId)
 			.sort(
 				(left, right) =>
 					right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId),
 			);
+	}
+
+	/** Rows contributed by registered C sources (a single "captain" entry today), activity-time sorted. */
+	#listCEntries(): SessionEntry[] {
+		const query = this.#sessionQuery.toLowerCase();
+		const entries: SessionEntry[] = [];
+		for (const source of listAgentViewSources()) {
+			try {
+				for (const entry of source.list()) {
+					const row: SessionEntry = { ...entry, origin: "c" };
+					if (this.#matchesQuery(row, query)) entries.push(row);
+				}
+			} catch {
+				// a misbehaving C source must never break the Agent View
+			}
+		}
+		return entries.sort(
+			(left, right) => right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId),
+		);
+	}
+
+	#matchesQuery(session: SessionEntry, query: string): boolean {
+		return (
+			query.length === 0 ||
+			session.sessionId.toLowerCase().includes(query) ||
+			session.cwd.toLowerCase().includes(query) ||
+			session.title.toLowerCase().includes(query) ||
+			(session.name?.toLowerCase().includes(query) ?? false)
+		);
 	}
 
 	#renderSessionOverview(): Container {
@@ -808,7 +833,13 @@ export class ExperimentalClientTui implements Component {
 			theme.fg("muted", ` · most active first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
 		container.addChild(new Text(header, 1, 1));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
+		const dividerLabel = listAgentViewSources()[0]?.label ?? "captain";
+		let dividerDrawn = false;
 		visible.slice(0, 20).forEach((session, index) => {
+			if (session.origin === "c" && !dividerDrawn) {
+				dividerDrawn = true;
+				container.addChild(new Text(theme.fg("muted", `── ${dividerLabel} ──`), 1, 1));
+			}
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
 			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
