@@ -661,6 +661,23 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	// Route 2: a plain interactive session runs as a client of the native daemon, so the session is
+	// durable and `←` on an empty prompt can background it and open the Agent View. Falls back to the
+	// local interactive mode when no daemon is reachable or the user asked for a local session.
+	if (
+		appMode === "interactive" &&
+		parsed.continue !== true &&
+		parsed.resume !== true &&
+		parsed.session === undefined &&
+		parsed.sessionId === undefined &&
+		parsed.fork === undefined &&
+		parsed.export === undefined &&
+		parsed.noSession !== true &&
+		process.env.PI_LOCAL_TUI !== "1"
+	) {
+		const { runDaemonInteractive } = await import("./cli/daemon-tui.ts");
+		if (await runDaemonInteractive({ command: "client" })) return;
+	}
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
