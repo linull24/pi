@@ -1,5 +1,6 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
 	combineFacetLoaders,
 	createFacetHost,
@@ -20,6 +21,7 @@ import {
 	setKeybindings,
 	Text,
 	type TUI,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { getAgentDir } from "../config.ts";
@@ -89,6 +91,60 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
+type SessionEntry = {
+	readonly sessionId: string;
+	readonly createdAt: number;
+	readonly cwd: string;
+	readonly title: string;
+	readonly entries: number;
+	readonly bytes: number;
+	readonly name: string | undefined;
+};
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function relativeTime(timestamp: number): string {
+	const diff = Date.now() - timestamp;
+	if (diff < 60_000) return "just now";
+	const minutes = Math.floor(diff / 60_000);
+	if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+	const days = Math.floor(hours / 24);
+	if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
+	const months = Math.floor(days / 30);
+	if (months < 12) return `${months} month${months === 1 ? "" : "s"} ago`;
+	const years = Math.floor(months / 12);
+	return `${years} year${years === 1 ? "" : "s"} ago`;
+}
+
+/** Claude Code-style rounded search field at the top of the session picker. */
+class SearchBox implements Component {
+	private readonly getQuery: () => string;
+
+	constructor(getQuery: () => string) {
+		this.getQuery = getQuery;
+	}
+
+	invalidate(): void {}
+	render(width: number): string[] {
+		const innerWidth = Math.max(1, width - 2);
+		const query = this.getQuery();
+		const label = query.length > 0 ? `⌕ ${query}` : theme.fg("muted", "⌕ Search…");
+		const pad = Math.max(0, innerWidth - visibleWidth(label) - 1);
+		const border = (text: string) => theme.fg("border", text);
+		return [
+			border(`╭${"─".repeat(innerWidth)}╮`),
+			`${border("│")} ${label}${" ".repeat(pad)}${border("│")}`,
+			border(`╰${"─".repeat(innerWidth)}╯`),
+		];
+	}
+}
+
 /** Service-only presentation driven by a replicated main-lane snapshot. */
 export class ExperimentalClientTui implements Component {
 	readonly #ui: TUI;
@@ -124,11 +180,14 @@ export class ExperimentalClientTui implements Component {
 	#recoveryTransition: Promise<void> = Promise.resolve();
 	#laneUnsubscribe: (() => void) | undefined;
 	#chatView: ExperimentalChatView | undefined;
-	#sessionItems: Array<{ sessionId: string; createdAt: number; cwd: string }> = [];
+	#sessionItems: SessionEntry[] = [];
 	#sessionIndex = 0;
 	#sessionQuery = "";
 	#sessionAll = false;
 	#sessionPreview = false;
+	#sessionRenaming = false;
+	#sessionRenameValue = "";
+	#documentHidden = false;
 
 	private constructor(
 		ui: TUI,
@@ -412,7 +471,21 @@ export class ExperimentalClientTui implements Component {
 			this.#statusContainer.addChild(new Text(theme.fg("dim", this.#status), 1, 0));
 		}
 		if (this.#chatView !== undefined) this.#statusContainer.addChild(this.#chatView.status);
-		this.#footerComponent.setText(theme.fg("dim", this.#footer()));
+		this.#footerComponent.setText(this.#screen === "sessions" ? "" : theme.fg("dim", this.#footer()));
+		if (this.#screen === "sessions") {
+			if (!this.#documentHidden) {
+				this.#documentContainer.clear();
+				this.#pendingMessagesContainer.clear();
+				this.#documentHidden = true;
+			}
+		} else if (this.#documentHidden) {
+			this.#documentContainer.clear();
+			if (this.#chatView !== undefined) {
+				this.#documentContainer.addChild(this.#sessionHeading);
+				this.#documentContainer.addChild(this.#chatView.transcript);
+			}
+			this.#documentHidden = false;
+		}
 		this.#editorContainer.clear();
 		if (this.#screen === "select" && this.#selection !== undefined) {
 			this.#chatInput.focused = false;
@@ -458,7 +531,7 @@ export class ExperimentalClientTui implements Component {
 	}
 
 	/** List local daemon sessions from the session store (no service re-open while attached). */
-	#listSessions(): Array<{ sessionId: string; createdAt: number; cwd: string }> {
+	#listSessions(): SessionEntry[] {
 		const root = join(getAgentDir(), "experimental", "sessions");
 		let ids: string[];
 		try {
@@ -466,14 +539,50 @@ export class ExperimentalClientTui implements Component {
 		} catch {
 			return [];
 		}
-		const sessions: Array<{ sessionId: string; createdAt: number; cwd: string }> = [];
+		const sessions: SessionEntry[] = [];
 		for (const id of ids) {
 			try {
-				const meta = JSON.parse(readFileSync(join(root, id, "meta.json"), "utf-8")) as {
+				const dir = join(root, id);
+				const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf-8")) as {
 					createdAt?: number;
 					cwd?: string;
+					name?: string;
 				};
-				sessions.push({ sessionId: id, createdAt: meta.createdAt ?? 0, cwd: meta.cwd ?? "" });
+				let title = "";
+				let entries = 0;
+				let bytes = 0;
+				try {
+					const dbPath = join(dir, "session.sqlite");
+					bytes = statSync(dbPath).size;
+					const db = new DatabaseSync(dbPath, { readOnly: true });
+					try {
+						const row = db
+							.prepare(
+								"select record from entries where json_extract(record, '$.kind') = 'pi.user' order by id asc limit 1",
+							)
+							.get() as unknown as { record?: string } | undefined;
+						if (row?.record !== undefined) {
+							const parsed = JSON.parse(row.record) as { model?: Array<{ content?: unknown }> };
+							const content = parsed.model?.[0]?.content;
+							if (typeof content === "string") title = content.replace(/\s+/gu, " ").trim().slice(0, 80);
+						}
+						const countRow = db.prepare("select count(*) as c from entries").get() as unknown as { c?: number };
+						entries = countRow?.c ?? 0;
+					} finally {
+						db.close();
+					}
+				} catch {
+					// session without a readable database
+				}
+				sessions.push({
+					sessionId: id,
+					createdAt: meta.createdAt ?? 0,
+					cwd: meta.cwd ?? "",
+					title,
+					entries,
+					bytes,
+					name: meta.name,
+				});
 			} catch {
 				// not a session directory
 			}
@@ -488,12 +597,13 @@ export class ExperimentalClientTui implements Component {
 		this.#sessionAll = false;
 		this.#sessionIndex = 0;
 		this.#sessionPreview = false;
+		this.#sessionRenaming = false;
 		this.#screen = "sessions";
 		this.#rebuild();
 	}
 
 	/** Sessions passing the current-directory / query filters, newest first. */
-	#visibleSessions(): Array<{ sessionId: string; createdAt: number; cwd: string }> {
+	#visibleSessions(): SessionEntry[] {
 		const query = this.#sessionQuery.toLowerCase();
 		return this.#sessionItems
 			.filter((session) => this.#sessionAll || session.cwd === process.cwd())
@@ -501,7 +611,9 @@ export class ExperimentalClientTui implements Component {
 				(session) =>
 					query.length === 0 ||
 					session.sessionId.toLowerCase().includes(query) ||
-					session.cwd.toLowerCase().includes(query),
+					session.cwd.toLowerCase().includes(query) ||
+					session.title.toLowerCase().includes(query) ||
+					(session.name?.toLowerCase().includes(query) ?? false),
 			)
 			.sort((left, right) => right.createdAt - left.createdAt || left.sessionId.localeCompare(right.sessionId));
 	}
@@ -509,34 +621,40 @@ export class ExperimentalClientTui implements Component {
 	#renderSessionOverview(): Container {
 		const container = new Container();
 		const visible = this.#visibleSessions();
-		const mode = this.#sessionAll ? "all projects" : `this dir: ${process.cwd()}`;
+		const scoped = this.#sessionItems.filter((session) => this.#sessionAll || session.cwd === process.cwd());
+		const position = visible.length === 0 ? 0 : Math.min(this.#sessionIndex + 1, visible.length);
 		container.addChild(
-			new Text(
-				theme.bold("Sessions") +
-					theme.fg(
-						"dim",
-						`  (${mode})  Ctrl+A all/this · type to search · Space preview · Enter switch · Esc back`,
-					),
-				1,
-				1,
-			),
+			new Text(theme.fg("accent", "Resume session") + theme.fg("muted", ` (${position} of ${scoped.length})`), 1, 1),
 		);
-		if (this.#sessionQuery.length > 0)
-			container.addChild(new Text(theme.fg("accent", `search: ${this.#sessionQuery}`), 1, 0));
-		if (visible.length === 0) container.addChild(new Text(theme.fg("dim", "  no sessions"), 1, 0));
-		visible.forEach((session, index) => {
+		container.addChild(new SearchBox(() => this.#sessionQuery));
+		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
+		visible.slice(0, 12).forEach((session, index) => {
 			const selected = index === this.#sessionIndex;
-			const line = `${session.sessionId}  ${new Date(session.createdAt).toLocaleString()}  ${session.cwd}`;
-			container.addChild(new Text(selected ? theme.fg("accent", `→ ${line}`) : `  ${line}`, 1, 0));
+			const name = this.#sessionName(session);
+			const marker = selected ? theme.fg("accent", "❯") : " ";
+			container.addChild(new Text(`${marker} ${selected ? theme.bold(name) : name}`, 1, 1));
+			container.addChild(
+				new Text(
+					theme.fg(
+						"muted",
+						`  ${relativeTime(session.createdAt)} · ${session.cwd || "(unknown)"} · ${formatBytes(session.bytes)}`,
+					),
+					1,
+					0,
+				),
+			);
 		});
+		if (this.#sessionRenaming) {
+			container.addChild(new Text(theme.fg("accent", `Rename: ${this.#sessionRenameValue}▏`), 1, 1));
+		}
 		if (this.#sessionPreview) {
 			const session = visible[this.#sessionIndex];
-			if (session) {
+			if (session !== undefined) {
 				container.addChild(
 					new Text(
 						theme.fg(
-							"dim",
-							`preview: ${session.sessionId}\n  cwd: ${session.cwd || "(unknown)"}\n  created: ${new Date(session.createdAt).toLocaleString()}`,
+							"muted",
+							`Preview: ${session.sessionId}\n  cwd: ${session.cwd || "(unknown)"}\n  entries: ${session.entries}\n  created: ${new Date(session.createdAt).toLocaleString()}`,
 						),
 						1,
 						1,
@@ -544,10 +662,28 @@ export class ExperimentalClientTui implements Component {
 				);
 			}
 		}
+		container.addChild(
+			new Text(theme.fg("muted", "Ctrl+A to show all projects · Type to search · Esc to cancel"), 1, 1),
+		);
+		container.addChild(new Text(theme.fg("muted", "Space to preview · Ctrl+R to rename · Enter to resume"), 1, 0));
 		return container;
 	}
 
+	#sessionName(session: SessionEntry): string {
+		if (session.name !== undefined && session.name.length > 0) return session.name;
+		if (session.title.length > 0) return session.title;
+		return session.sessionId.slice(0, 8);
+	}
+
 	#handleSessionOverviewInput(data: string): void {
+		if (this.#sessionRenaming) {
+			if (data === "\r" || data === "\n") this.#saveSessionName();
+			else if (data === "\u001b") this.#sessionRenaming = false;
+			else if (data === "\u007f") this.#sessionRenameValue = this.#sessionRenameValue.slice(0, -1);
+			else if (data.length === 1 && data >= " ") this.#sessionRenameValue += data;
+			this.#rebuild();
+			return;
+		}
 		const count = Math.max(this.#visibleSessions().length, 1);
 		if (data === "\u001b[A") this.#sessionIndex = (this.#sessionIndex - 1 + count) % count;
 		else if (data === "\u001b[B") this.#sessionIndex = (this.#sessionIndex + 1) % count;
@@ -559,6 +695,12 @@ export class ExperimentalClientTui implements Component {
 		} else if (data === "\u0001") {
 			this.#sessionAll = !this.#sessionAll;
 			this.#sessionIndex = 0;
+		} else if (data === "\u0012") {
+			const session = this.#visibleSessions()[this.#sessionIndex];
+			if (session !== undefined) {
+				this.#sessionRenaming = true;
+				this.#sessionRenameValue = session.name ?? session.title;
+			}
 		} else if (data === " ") {
 			this.#sessionPreview = !this.#sessionPreview;
 		} else if (data === "\u007f") {
@@ -569,6 +711,21 @@ export class ExperimentalClientTui implements Component {
 			this.#sessionIndex = 0;
 		}
 		this.#rebuild();
+	}
+
+	#saveSessionName(): void {
+		const session = this.#visibleSessions()[this.#sessionIndex];
+		this.#sessionRenaming = false;
+		if (session === undefined) return;
+		try {
+			const path = join(getAgentDir(), "experimental", "sessions", session.sessionId, "meta.json");
+			const meta = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+			meta.name = this.#sessionRenameValue;
+			writeFileSync(path, JSON.stringify(meta));
+		} catch {
+			// ignore rename failures
+		}
+		this.#sessionItems = this.#listSessions();
 	}
 
 	async #confirmSession(): Promise<void> {
