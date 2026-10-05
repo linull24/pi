@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
 	combineFacetLoaders,
 	createFacetHost,
@@ -93,6 +94,7 @@ export class ExperimentalClientTui implements Component {
 	readonly #ui: TUI;
 	readonly #requestRender: () => void;
 	readonly #finish: () => void;
+	#restartSessionId: string | undefined;
 	readonly #documentContainer = new Container();
 	readonly #sessionHeading = new Text("", 1, 0);
 	readonly #pendingMessagesContainer = new Container();
@@ -102,6 +104,7 @@ export class ExperimentalClientTui implements Component {
 	readonly #layoutRoot: Component;
 	readonly #sharedFacets: LoadedFacets;
 	readonly #keybindings = KeybindingsManager.create();
+	readonly #servers: readonly ClientTuiServer[];
 	#presentationFacets: LoadedFacets | undefined;
 	#facetHost: FacetHost | undefined;
 	#facetReloadTail = Promise.resolve();
@@ -111,7 +114,7 @@ export class ExperimentalClientTui implements Component {
 	readonly #chatInput: CustomEditor;
 	#selectList: SelectList | undefined;
 	#selection: PendingSelection | undefined;
-	#screen: "select" | "chat" = "chat";
+	#screen: "select" | "sessions" | "chat" = "chat";
 	#selectedServerId: string | undefined;
 	#sessionId: string | undefined;
 	#status = "Starting Session…";
@@ -121,12 +124,24 @@ export class ExperimentalClientTui implements Component {
 	#recoveryTransition: Promise<void> = Promise.resolve();
 	#laneUnsubscribe: (() => void) | undefined;
 	#chatView: ExperimentalChatView | undefined;
+	#sessionItems: Array<{ sessionId: string; createdAt: number; cwd: string }> = [];
+	#sessionIndex = 0;
+	#sessionQuery = "";
+	#sessionAll = false;
+	#sessionPreview = false;
 
-	private constructor(ui: TUI, requestRender: () => void, finish: () => void, loadedFacets: LoadedFacets) {
+	private constructor(
+		ui: TUI,
+		requestRender: () => void,
+		finish: () => void,
+		loadedFacets: LoadedFacets,
+		servers: readonly ClientTuiServer[],
+	) {
 		this.#ui = ui;
 		this.#requestRender = requestRender;
 		this.#finish = finish;
 		this.#sharedFacets = loadedFacets;
+		this.#servers = servers;
 		setKeybindings(this.#keybindings);
 		this.#chatInput = new CustomEditor(ui, getEditorTheme(), this.#keybindings, { paddingX: 1 });
 		this.#chatInput.onSubmit = (message) => void this.#runPrompt(message);
@@ -165,7 +180,13 @@ export class ExperimentalClientTui implements Component {
 		const loadedFacets = await combineFacetLoaders(
 			options.facetLoader === undefined ? [] : [options.facetLoader],
 		).load();
-		const component = new ExperimentalClientTui(options.ui, options.requestRender, options.finish, loadedFacets);
+		const component = new ExperimentalClientTui(
+			options.ui,
+			options.requestRender,
+			options.finish,
+			loadedFacets,
+			options.servers,
+		);
 		try {
 			await component.#start(prepared);
 			await component.#openPreparedSession(prepared);
@@ -182,6 +203,11 @@ export class ExperimentalClientTui implements Component {
 
 	get layoutRoot(): Component {
 		return this.#layoutRoot;
+	}
+
+	/** Session chosen in the overview; runClientTui restarts the TUI bound to it. */
+	get restartSessionId(): string | undefined {
+		return this.#restartSessionId;
 	}
 
 	render(width: number): string[] {
@@ -205,8 +231,17 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		if (this.#screen === "chat") {
+			// ← on an empty editor opens the all-sessions overview (Claude Code-style switch).
+			if (!this.#busy && (data === "\u001b[D" || data === "\u001bOD") && this.#chatInput.getText().length === 0) {
+				this.#openSessionOverview();
+				return;
+			}
 			this.#chatInput.handleInput(data);
 			this.#requestRender();
+			return;
+		}
+		if (this.#screen === "sessions") {
+			this.#handleSessionOverviewInput(data);
 			return;
 		}
 		this.#selectList?.handleInput(data);
@@ -391,6 +426,10 @@ export class ExperimentalClientTui implements Component {
 			this.#selectList.onCancel = () => this.#completeSelection(undefined);
 			selector.addChild(this.#selectList);
 			this.#editorContainer.addChild(selector);
+		} else if (this.#screen === "sessions") {
+			this.#selectList = undefined;
+			this.#chatInput.focused = false;
+			this.#editorContainer.addChild(this.#renderSessionOverview());
 		} else {
 			this.#selectList = undefined;
 			this.#chatInput.focused = !this.#busy;
@@ -416,6 +455,132 @@ export class ExperimentalClientTui implements Component {
 		this.#screen = "chat";
 		selection.resolve(value);
 		if (!this.#closed) this.#rebuild();
+	}
+
+	/** List local daemon sessions from the session store (no service re-open while attached). */
+	#listSessions(): Array<{ sessionId: string; createdAt: number; cwd: string }> {
+		const root = join(getAgentDir(), "experimental", "sessions");
+		let ids: string[];
+		try {
+			ids = readdirSync(root);
+		} catch {
+			return [];
+		}
+		const sessions: Array<{ sessionId: string; createdAt: number; cwd: string }> = [];
+		for (const id of ids) {
+			try {
+				const meta = JSON.parse(readFileSync(join(root, id, "meta.json"), "utf-8")) as {
+					createdAt?: number;
+					cwd?: string;
+				};
+				sessions.push({ sessionId: id, createdAt: meta.createdAt ?? 0, cwd: meta.cwd ?? "" });
+			} catch {
+				// not a session directory
+			}
+		}
+		return sessions;
+	}
+
+	/** Full-screen all-sessions overview; picking one switches and returns to chat. */
+	#openSessionOverview(): void {
+		this.#sessionItems = this.#listSessions();
+		this.#sessionQuery = "";
+		this.#sessionAll = false;
+		this.#sessionIndex = 0;
+		this.#sessionPreview = false;
+		this.#screen = "sessions";
+		this.#rebuild();
+	}
+
+	/** Sessions passing the current-directory / query filters, newest first. */
+	#visibleSessions(): Array<{ sessionId: string; createdAt: number; cwd: string }> {
+		const query = this.#sessionQuery.toLowerCase();
+		return this.#sessionItems
+			.filter((session) => this.#sessionAll || session.cwd === process.cwd())
+			.filter(
+				(session) =>
+					query.length === 0 ||
+					session.sessionId.toLowerCase().includes(query) ||
+					session.cwd.toLowerCase().includes(query),
+			)
+			.sort((left, right) => right.createdAt - left.createdAt || left.sessionId.localeCompare(right.sessionId));
+	}
+
+	#renderSessionOverview(): Container {
+		const container = new Container();
+		const visible = this.#visibleSessions();
+		const mode = this.#sessionAll ? "all projects" : `this dir: ${process.cwd()}`;
+		container.addChild(
+			new Text(
+				theme.bold("Sessions") +
+					theme.fg(
+						"dim",
+						`  (${mode})  Ctrl+A all/this · type to search · Space preview · Enter switch · Esc back`,
+					),
+				1,
+				1,
+			),
+		);
+		if (this.#sessionQuery.length > 0)
+			container.addChild(new Text(theme.fg("accent", `search: ${this.#sessionQuery}`), 1, 0));
+		if (visible.length === 0) container.addChild(new Text(theme.fg("dim", "  no sessions"), 1, 0));
+		visible.forEach((session, index) => {
+			const selected = index === this.#sessionIndex;
+			const line = `${session.sessionId}  ${new Date(session.createdAt).toLocaleString()}  ${session.cwd}`;
+			container.addChild(new Text(selected ? theme.fg("accent", `→ ${line}`) : `  ${line}`, 1, 0));
+		});
+		if (this.#sessionPreview) {
+			const session = visible[this.#sessionIndex];
+			if (session) {
+				container.addChild(
+					new Text(
+						theme.fg(
+							"dim",
+							`preview: ${session.sessionId}\n  cwd: ${session.cwd || "(unknown)"}\n  created: ${new Date(session.createdAt).toLocaleString()}`,
+						),
+						1,
+						1,
+					),
+				);
+			}
+		}
+		return container;
+	}
+
+	#handleSessionOverviewInput(data: string): void {
+		const count = Math.max(this.#visibleSessions().length, 1);
+		if (data === "\u001b[A") this.#sessionIndex = (this.#sessionIndex - 1 + count) % count;
+		else if (data === "\u001b[B") this.#sessionIndex = (this.#sessionIndex + 1) % count;
+		else if (data === "\r" || data === "\n") {
+			void this.#confirmSession();
+			return;
+		} else if (data === "\u001b") {
+			this.#screen = "chat";
+		} else if (data === "\u0001") {
+			this.#sessionAll = !this.#sessionAll;
+			this.#sessionIndex = 0;
+		} else if (data === " ") {
+			this.#sessionPreview = !this.#sessionPreview;
+		} else if (data === "\u007f") {
+			this.#sessionQuery = this.#sessionQuery.slice(0, -1);
+			this.#sessionIndex = 0;
+		} else if (data.length === 1 && data >= " ") {
+			this.#sessionQuery += data;
+			this.#sessionIndex = 0;
+		}
+		this.#rebuild();
+	}
+
+	async #confirmSession(): Promise<void> {
+		const target = this.#visibleSessions()[this.#sessionIndex];
+		this.#screen = "chat";
+		if (target === undefined || target.sessionId === this.#sessionId) {
+			this.#rebuild();
+			return;
+		}
+		// Rebind by restarting the TUI on the chosen Session; runClientTui loops on restartSessionId.
+		this.#restartSessionId = target.sessionId;
+		this.#finish();
 	}
 
 	#updateAutocomplete(): void {
@@ -758,39 +923,48 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 		showError: (error) => component?.showError(error),
 		onChanged: () => component?.refreshTheme(),
 	});
+	const servers = runtime.servers.map((server) => ({
+		serverId: server.route.serverId,
+		radius: server.route.transport === "radius",
+		server: server.server,
+		session: server.session,
+	}));
 	try {
-		let finish!: () => void;
-		const finished = new Promise<void>((resolve) => {
-			finish = () => {
-				themeController.disableAutoSync();
-				if (tuiStarted) {
-					tui.stop();
-					tuiStarted = false;
-				}
-				resolve();
-			};
-		});
-		component = await ExperimentalClientTui.create({
-			command,
-			ui: tui,
-			servers: runtime.servers.map((server) => ({
-				serverId: server.route.serverId,
-				radius: server.route.transport === "radius",
-				server: server.server,
-				session: server.session,
-			})),
-			facetLoader: options.facetLoader,
-			requestRender: () => tui.requestRender(),
-			finish,
-		});
-		tui.addChild(component);
-		tui.setLayoutRoot(component.layoutRoot);
-		tui.setFocus(component);
-		tuiStarted = true;
-		tui.start();
-		themeController.applyFromSettings();
-		await finished;
+		// The overview can ask to switch Session; restart the TUI bound to the chosen one.
+		let nextSessionId: string | undefined;
+		for (;;) {
+			let finish!: () => void;
+			const finished = new Promise<void>((resolve) => {
+				finish = () => resolve();
+			});
+			const created = await ExperimentalClientTui.create({
+				command: nextSessionId === undefined ? command : { ...command, sessionId: nextSessionId },
+				ui: tui,
+				servers,
+				facetLoader: options.facetLoader,
+				requestRender: () => tui.requestRender(),
+				finish,
+			});
+			component = created;
+			tui.addChild(created);
+			tui.setLayoutRoot(created.layoutRoot);
+			tui.setFocus(created);
+			if (!tuiStarted) {
+				tuiStarted = true;
+				tui.start();
+				themeController.applyFromSettings();
+			} else {
+				tui.requestRender();
+			}
+			await finished;
+			nextSessionId = created.restartSessionId;
+			await created.close();
+			tui.removeChild(created);
+			component = undefined;
+			if (nextSessionId === undefined) break;
+		}
 	} finally {
+		themeController.disableAutoSync();
 		themeController.dispose();
 		stopThemeWatcher();
 		if (tuiStarted) tui.stop();
