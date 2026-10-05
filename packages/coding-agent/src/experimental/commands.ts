@@ -66,7 +66,7 @@ async function runServerCommand(command: ServerCommand): Promise<void> {
 
 export async function runClientCommand(command: ClientCommand): Promise<void> {
 	if (command.prompt === undefined && process.stdin.isTTY === true && process.stdout.isTTY === true) {
-		await runClientTui(command);
+		await runClientTui(command, { startInAgentsView: command.agents === true });
 		return;
 	}
 	const result = await runClient(command);

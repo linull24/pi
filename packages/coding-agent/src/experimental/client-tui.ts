@@ -21,7 +21,6 @@ import {
 	setKeybindings,
 	Text,
 	type TUI,
-	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { getAgentDir } from "../config.ts";
@@ -55,6 +54,8 @@ import { Transcript, type Transcript as TranscriptService } from "./services/tra
 
 export interface RunClientTuiOptions extends OpenClientRuntimeOptions {
 	readonly facetLoader?: FacetLoader;
+	/** Open straight into the Agent View (same screen as pressing ← in a session). */
+	readonly startInAgentsView?: boolean;
 }
 
 export interface ClientTuiServer {
@@ -91,15 +92,63 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
+type AgentRowState = "working" | "needs-input" | "idle" | "completed" | "failed";
+
+const AGENT_STATE_ORDER: readonly AgentRowState[] = ["working", "needs-input", "idle", "completed", "failed"];
+
 type SessionEntry = {
 	readonly sessionId: string;
 	readonly createdAt: number;
 	readonly cwd: string;
 	readonly title: string;
+	readonly activity: string;
+	readonly state: AgentRowState;
 	readonly entries: number;
 	readonly bytes: number;
 	readonly name: string | undefined;
 };
+
+function parseRecordContent(record: string): unknown {
+	try {
+		const parsed = JSON.parse(record) as { model?: Array<{ content?: unknown }> };
+		return parsed.model?.[0]?.content;
+	} catch {
+		return undefined;
+	}
+}
+
+function extractText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content
+			.map((part) =>
+				part !== null &&
+				typeof part === "object" &&
+				"text" in part &&
+				typeof (part as { text?: unknown }).text === "string"
+					? (part as { text: string }).text
+					: "",
+			)
+			.join(" ");
+	}
+	return "";
+}
+
+function agentIcon(state: AgentRowState): string {
+	if (state === "working") return theme.fg("accent", "✽");
+	if (state === "needs-input") return theme.fg("warning", "✻");
+	if (state === "completed") return theme.fg("success", "✻");
+	if (state === "failed") return theme.fg("error", "✗");
+	return theme.fg("muted", "∙");
+}
+
+function agentStateLabel(state: AgentRowState): string {
+	if (state === "working") return "Working";
+	if (state === "needs-input") return "Needs input";
+	if (state === "completed") return "Completed";
+	if (state === "failed") return "Failed";
+	return "Idle";
+}
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
@@ -120,29 +169,6 @@ function relativeTime(timestamp: number): string {
 	if (months < 12) return `${months} month${months === 1 ? "" : "s"} ago`;
 	const years = Math.floor(months / 12);
 	return `${years} year${years === 1 ? "" : "s"} ago`;
-}
-
-/** Claude Code-style rounded search field at the top of the session picker. */
-class SearchBox implements Component {
-	private readonly getQuery: () => string;
-
-	constructor(getQuery: () => string) {
-		this.getQuery = getQuery;
-	}
-
-	invalidate(): void {}
-	render(width: number): string[] {
-		const innerWidth = Math.max(1, width - 2);
-		const query = this.getQuery();
-		const label = query.length > 0 ? `⌕ ${query}` : theme.fg("muted", "⌕ Search…");
-		const pad = Math.max(0, innerWidth - visibleWidth(label) - 1);
-		const border = (text: string) => theme.fg("border", text);
-		return [
-			border(`╭${"─".repeat(innerWidth)}╮`),
-			`${border("│")} ${label}${" ".repeat(pad)}${border("│")}`,
-			border(`╰${"─".repeat(innerWidth)}╯`),
-		];
-	}
 }
 
 /** Service-only presentation driven by a replicated main-lane snapshot. */
@@ -187,6 +213,7 @@ export class ExperimentalClientTui implements Component {
 	#sessionPreview = false;
 	#sessionRenaming = false;
 	#sessionRenameValue = "";
+	#agentDispatch = "";
 	#documentHidden = false;
 
 	private constructor(
@@ -232,6 +259,7 @@ export class ExperimentalClientTui implements Component {
 		readonly ui: TUI;
 		readonly servers: readonly ClientTuiServer[];
 		readonly facetLoader?: FacetLoader;
+		readonly startInAgentsView?: boolean;
 		requestRender(): void;
 		finish(): void;
 	}): Promise<ExperimentalClientTui> {
@@ -249,6 +277,7 @@ export class ExperimentalClientTui implements Component {
 		try {
 			await component.#start(prepared);
 			await component.#openPreparedSession(prepared);
+			if (options.startInAgentsView === true) component.#openSessionOverview();
 			return component;
 		} catch (error) {
 			try {
@@ -549,25 +578,49 @@ export class ExperimentalClientTui implements Component {
 					name?: string;
 				};
 				let title = "";
+				let activity = "";
 				let entries = 0;
 				let bytes = 0;
+				let state: AgentRowState = "idle";
 				try {
 					const dbPath = join(dir, "session.sqlite");
 					bytes = statSync(dbPath).size;
 					const db = new DatabaseSync(dbPath, { readOnly: true });
 					try {
-						const row = db
+						const firstUser = db
 							.prepare(
 								"select record from entries where json_extract(record, '$.kind') = 'pi.user' order by id asc limit 1",
 							)
 							.get() as unknown as { record?: string } | undefined;
-						if (row?.record !== undefined) {
-							const parsed = JSON.parse(row.record) as { model?: Array<{ content?: unknown }> };
-							const content = parsed.model?.[0]?.content;
-							if (typeof content === "string") title = content.replace(/\s+/gu, " ").trim().slice(0, 80);
+						if (firstUser?.record !== undefined) {
+							title = extractText(parseRecordContent(firstUser.record))
+								.replace(/\s+/gu, " ")
+								.trim()
+								.slice(0, 80);
+						}
+						const lastAssistant = db
+							.prepare(
+								"select record from entries where json_extract(record, '$.kind') = 'pi.assistant' order by id desc limit 1",
+							)
+							.get() as unknown as { record?: string } | undefined;
+						if (lastAssistant?.record !== undefined) {
+							activity = extractText(parseRecordContent(lastAssistant.record))
+								.replace(/\s+/gu, " ")
+								.trim()
+								.slice(0, 80);
 						}
 						const countRow = db.prepare("select count(*) as c from entries").get() as unknown as { c?: number };
 						entries = countRow?.c ?? 0;
+						const task = db
+							.prepare("select status, record from tasks order by id desc limit 1")
+							.get() as unknown as { status?: string; record?: string } | undefined;
+						const status = task?.status;
+						if (status === "running" || status === "pending" || status === "completing") state = "working";
+						else if (status === "waiting") state = "needs-input";
+						else if (status === "terminal")
+							state = /"(?:error|is_error)":\s*(?:"[^"]+"|true)/u.test(task?.record ?? "")
+								? "failed"
+								: "completed";
 					} finally {
 						db.close();
 					}
@@ -579,6 +632,8 @@ export class ExperimentalClientTui implements Component {
 					createdAt: meta.createdAt ?? 0,
 					cwd: meta.cwd ?? "",
 					title,
+					activity,
+					state,
 					entries,
 					bytes,
 					name: meta.name,
@@ -598,6 +653,7 @@ export class ExperimentalClientTui implements Component {
 		this.#sessionIndex = 0;
 		this.#sessionPreview = false;
 		this.#sessionRenaming = false;
+		this.#agentDispatch = "";
 		this.#screen = "sessions";
 		this.#rebuild();
 	}
@@ -615,30 +671,41 @@ export class ExperimentalClientTui implements Component {
 					session.title.toLowerCase().includes(query) ||
 					(session.name?.toLowerCase().includes(query) ?? false),
 			)
-			.sort((left, right) => right.createdAt - left.createdAt || left.sessionId.localeCompare(right.sessionId));
+			.sort(
+				(left, right) =>
+					AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
+					right.createdAt - left.createdAt ||
+					left.sessionId.localeCompare(right.sessionId),
+			);
 	}
 
 	#renderSessionOverview(): Container {
 		const container = new Container();
 		const visible = this.#visibleSessions();
 		const scoped = this.#sessionItems.filter((session) => this.#sessionAll || session.cwd === process.cwd());
-		const position = visible.length === 0 ? 0 : Math.min(this.#sessionIndex + 1, visible.length);
-		container.addChild(
-			new Text(theme.fg("accent", "Resume session") + theme.fg("muted", ` (${position} of ${scoped.length})`), 1, 1),
-		);
-		container.addChild(new SearchBox(() => this.#sessionQuery));
+		const needsInput = scoped.filter((session) => session.state === "needs-input").length;
+		const header =
+			theme.fg("accent", "Agent view") +
+			theme.fg("muted", `  ${scoped.length} session${scoped.length === 1 ? "" : "s"}`) +
+			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "") +
+			theme.fg("muted", ` · ${process.cwd()}`);
+		container.addChild(new Text(header, 1, 1));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
-		visible.slice(0, 12).forEach((session, index) => {
+		let lastState: AgentRowState | undefined;
+		visible.slice(0, 20).forEach((session, index) => {
+			if (session.state !== lastState) {
+				container.addChild(new Text(theme.fg("muted", agentStateLabel(session.state)), 1, 1));
+				lastState = session.state;
+			}
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
-			const marker = selected ? theme.fg("accent", "❯") : " ";
-			container.addChild(new Text(`${marker} ${selected ? theme.bold(name) : name}`, 1, 1));
+			const current = session.sessionId === this.#sessionId ? theme.fg("muted", " (current)") : "";
+			const activity = session.activity.length > 0 ? `  ${theme.fg("muted", session.activity)}` : "";
+			const age = theme.fg("muted", `  ${relativeTime(session.createdAt)}`);
+			const prefix = selected ? `${theme.fg("accent", "❯")} ` : "  ";
 			container.addChild(
 				new Text(
-					theme.fg(
-						"muted",
-						`  ${relativeTime(session.createdAt)} · ${session.cwd || "(unknown)"} · ${formatBytes(session.bytes)}`,
-					),
+					`${prefix}${agentIcon(session.state)} ${selected ? theme.bold(name) : name}${current}${activity}${age}`,
 					1,
 					0,
 				),
@@ -654,7 +721,7 @@ export class ExperimentalClientTui implements Component {
 					new Text(
 						theme.fg(
 							"muted",
-							`Preview: ${session.sessionId}\n  cwd: ${session.cwd || "(unknown)"}\n  entries: ${session.entries}\n  created: ${new Date(session.createdAt).toLocaleString()}`,
+							`── peek ──\n  ${session.activity || session.title || "(no output yet)"}\n  cwd: ${session.cwd || "(unknown)"} · entries: ${session.entries} · ${formatBytes(session.bytes)}`,
 						),
 						1,
 						1,
@@ -662,10 +729,18 @@ export class ExperimentalClientTui implements Component {
 				);
 			}
 		}
+		const composer =
+			this.#agentDispatch.length > 0
+				? this.#agentDispatch
+				: theme.fg("muted", "Describe a task to dispatch a new agent…");
+		container.addChild(new Text(`${theme.fg("accent", "❯")} ${composer}`, 1, 1));
 		container.addChild(
-			new Text(theme.fg("muted", "Ctrl+A to show all projects · Type to search · Esc to cancel"), 1, 1),
+			new Text(
+				theme.fg("muted", "↑/↓ move · Space peek · Enter attach · Ctrl+R rename · Ctrl+X stop · Esc exit"),
+				1,
+				1,
+			),
 		);
-		container.addChild(new Text(theme.fg("muted", "Space to preview · Ctrl+R to rename · Enter to resume"), 1, 0));
 		return container;
 	}
 
@@ -684,14 +759,26 @@ export class ExperimentalClientTui implements Component {
 			this.#rebuild();
 			return;
 		}
-		const count = Math.max(this.#visibleSessions().length, 1);
-		if (data === "\u001b[A") this.#sessionIndex = (this.#sessionIndex - 1 + count) % count;
-		else if (data === "\u001b[B") this.#sessionIndex = (this.#sessionIndex + 1) % count;
-		else if (data === "\r" || data === "\n") {
+		if (data === "\u001b[A" || data === "\u001bOA") {
+			const count = Math.max(this.#visibleSessions().length, 1);
+			this.#sessionIndex = (this.#sessionIndex - 1 + count) % count;
+		} else if (data === "\u001b[B" || data === "\u001bOB") {
+			const count = Math.max(this.#visibleSessions().length, 1);
+			this.#sessionIndex = (this.#sessionIndex + 1) % count;
+		} else if (data === "\u001b[C" || data === "\u001bOC") {
+			void this.#confirmSession();
+			return;
+		} else if (data === "\r" || data === "\n") {
+			if (this.#agentDispatch.trim().length > 0) {
+				void this.#dispatchAgent(this.#agentDispatch.trim());
+				return;
+			}
 			void this.#confirmSession();
 			return;
 		} else if (data === "\u001b") {
-			this.#screen = "chat";
+			if (this.#sessionPreview) this.#sessionPreview = false;
+			else if (this.#agentDispatch.length > 0) this.#agentDispatch = "";
+			else this.#screen = "chat";
 		} else if (data === "\u0001") {
 			this.#sessionAll = !this.#sessionAll;
 			this.#sessionIndex = 0;
@@ -701,15 +788,80 @@ export class ExperimentalClientTui implements Component {
 				this.#sessionRenaming = true;
 				this.#sessionRenameValue = session.name ?? session.title;
 			}
+		} else if (data === "\u0018") {
+			void this.#stopAgent();
+			return;
 		} else if (data === " ") {
 			this.#sessionPreview = !this.#sessionPreview;
 		} else if (data === "\u007f") {
-			this.#sessionQuery = this.#sessionQuery.slice(0, -1);
-			this.#sessionIndex = 0;
+			this.#agentDispatch = this.#agentDispatch.slice(0, -1);
 		} else if (data.length === 1 && data >= " ") {
-			this.#sessionQuery += data;
-			this.#sessionIndex = 0;
+			this.#agentDispatch += data;
 		}
+		this.#rebuild();
+	}
+
+	/** Dispatch a new background agent: create a Session and send the prompt. */
+	async #dispatchAgent(prompt: string): Promise<void> {
+		this.#status = "Dispatching…";
+		this.#agentDispatch = "";
+		this.#rebuild();
+		try {
+			const server = this.#servers[0];
+			if (server === undefined) throw new Error("no server available");
+			const opened = server.server.open({
+				services: [SessionManagement, PresentationPlugins, AgentController],
+				assertAccess() {},
+				onError() {},
+			});
+			try {
+				await opened.ready(BACKGROUND_CONTEXT);
+				const management = opened.use(SessionManagement);
+				const plugins = opened.use(PresentationPlugins);
+				const controller = opened.use(AgentController);
+				const summary = await management.create({}, BACKGROUND_CONTEXT);
+				await plugins.prepareSession({ sessionId: summary.sessionId, packagePaths: null }, BACKGROUND_CONTEXT);
+				await management.attach(summary.sessionId, BACKGROUND_CONTEXT);
+				await controller.prompt({ message: prompt, images: null }, BACKGROUND_CONTEXT);
+			} finally {
+				await opened.dispose(BACKGROUND_CONTEXT);
+			}
+			this.#status = "";
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+		this.#sessionItems = this.#listSessions();
+		this.#rebuild();
+	}
+
+	/** Stop the selected background agent (abort its active run). */
+	async #stopAgent(): Promise<void> {
+		const session = this.#visibleSessions()[this.#sessionIndex];
+		if (session === undefined) return;
+		this.#status = `Stopping ${session.sessionId.slice(0, 8)}…`;
+		this.#rebuild();
+		try {
+			const server = this.#servers[0];
+			if (server === undefined) throw new Error("no server available");
+			const opened = server.server.open({
+				services: [SessionManagement, AgentController],
+				assertAccess() {},
+				onError() {},
+			});
+			try {
+				await opened.ready(BACKGROUND_CONTEXT);
+				const management = opened.use(SessionManagement);
+				const controller = opened.use(AgentController);
+				await management.attach(session.sessionId, BACKGROUND_CONTEXT);
+				await controller.abort(BACKGROUND_CONTEXT);
+			} finally {
+				await opened.dispose(BACKGROUND_CONTEXT);
+			}
+			this.#status = "";
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+		this.#sessionItems = this.#listSessions();
 		this.#rebuild();
 	}
 
@@ -1053,6 +1205,14 @@ async function prepareClientSession(
 export async function runClientTui(command: ClientCommand, options: RunClientTuiOptions = {}): Promise<void> {
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
+	// `pi agents` opens the Agent View without creating an empty session; attach to the newest.
+	const baseCommand: ClientCommand =
+		options.startInAgentsView === true &&
+		command.sessionId === undefined &&
+		command.continue !== true &&
+		command.resume !== true
+			? { ...command, continue: true }
+			: command;
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -1095,10 +1255,11 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 				finish = () => resolve();
 			});
 			const created = await ExperimentalClientTui.create({
-				command: nextSessionId === undefined ? command : { ...command, sessionId: nextSessionId },
+				command: nextSessionId === undefined ? baseCommand : { ...baseCommand, sessionId: nextSessionId },
 				ui: tui,
 				servers,
 				facetLoader: options.facetLoader,
+				startInAgentsView: nextSessionId === undefined ? options.startInAgentsView : false,
 				requestRender: () => tui.requestRender(),
 				finish,
 			});

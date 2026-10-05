@@ -20,6 +20,7 @@ export interface ClientCommand {
 	readonly model?: string;
 	readonly pluginPackages?: readonly string[];
 	readonly prompt?: string;
+	readonly agents?: boolean;
 }
 
 export interface ClientCommandContext {

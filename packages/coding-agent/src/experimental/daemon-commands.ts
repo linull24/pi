@@ -76,8 +76,8 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 
 	try {
 		if (command === "agents") {
-			// No prompt and no session id: the client lists sessions (TUI picker when interactive).
-			await runClientCommand({ command: "client" });
+			// Same Agent View as pressing ← inside a session (Claude/Codex parity).
+			await runClientCommand({ command: "client", agents: true });
 			return true;
 		}
 
