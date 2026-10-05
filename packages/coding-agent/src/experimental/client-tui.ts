@@ -809,22 +809,48 @@ export class ExperimentalClientTui implements Component {
 		try {
 			const server = this.#servers[0];
 			if (server === undefined) throw new Error("no server available");
-			const opened = server.server.open({
-				services: [SessionManagement, PresentationPlugins, AgentController],
+			const serverServices = server.server.open({
+				services: [SessionDirectory, SessionManagement, PresentationPlugins],
 				assertAccess() {},
 				onError() {},
 			});
+			const sessionServices = server.session.open({
+				services: [AgentController],
+				assertAccess() {},
+				onError() {},
+			});
+			const disposeAll = async (): Promise<void> => {
+				await Promise.allSettled([
+					serverServices.dispose(BACKGROUND_CONTEXT),
+					sessionServices.dispose(BACKGROUND_CONTEXT),
+				]);
+			};
 			try {
-				await opened.ready(BACKGROUND_CONTEXT);
-				const management = opened.use(SessionManagement);
-				const plugins = opened.use(PresentationPlugins);
-				const controller = opened.use(AgentController);
+				await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
+				const management = serverServices.use(SessionManagement);
+				const plugins = serverServices.use(PresentationPlugins);
+				const controller = sessionServices.use(AgentController);
 				const summary = await management.create({}, BACKGROUND_CONTEXT);
 				await plugins.prepareSession({ sessionId: summary.sessionId, packagePaths: null }, BACKGROUND_CONTEXT);
 				await management.attach(summary.sessionId, BACKGROUND_CONTEXT);
-				await controller.prompt({ message: prompt, images: null }, BACKGROUND_CONTEXT);
-			} finally {
-				await opened.dispose(BACKGROUND_CONTEXT);
+				await server.session.whenAttached(summary.sessionId, BACKGROUND_CONTEXT);
+				const response = await controller.prompt({ message: prompt, images: null }, BACKGROUND_CONTEXT);
+				if (!response.accepted) throw new Error(response.error.message);
+				// Keep the connection until the durable task is recorded; the agent keeps running
+				// server-side and the TUI stays interactive while we wait.
+				void controller
+					.waitForPrompt(response.operationId, BACKGROUND_CONTEXT)
+					.then(
+						() => {
+							this.#sessionItems = this.#listSessions();
+							this.#rebuild();
+						},
+						() => {},
+					)
+					.finally(() => void disposeAll());
+			} catch (error) {
+				await disposeAll();
+				throw error;
 			}
 			this.#status = "";
 		} catch (error) {
@@ -843,19 +869,28 @@ export class ExperimentalClientTui implements Component {
 		try {
 			const server = this.#servers[0];
 			if (server === undefined) throw new Error("no server available");
-			const opened = server.server.open({
-				services: [SessionManagement, AgentController],
+			const serverServices = server.server.open({
+				services: [SessionManagement],
+				assertAccess() {},
+				onError() {},
+			});
+			const sessionServices = server.session.open({
+				services: [AgentController],
 				assertAccess() {},
 				onError() {},
 			});
 			try {
-				await opened.ready(BACKGROUND_CONTEXT);
-				const management = opened.use(SessionManagement);
-				const controller = opened.use(AgentController);
+				await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
+				const management = serverServices.use(SessionManagement);
+				const controller = sessionServices.use(AgentController);
 				await management.attach(session.sessionId, BACKGROUND_CONTEXT);
+				await server.session.whenAttached(session.sessionId, BACKGROUND_CONTEXT);
 				await controller.abort(BACKGROUND_CONTEXT);
 			} finally {
-				await opened.dispose(BACKGROUND_CONTEXT);
+				await Promise.allSettled([
+					serverServices.dispose(BACKGROUND_CONTEXT),
+					sessionServices.dispose(BACKGROUND_CONTEXT),
+				]);
 			}
 			this.#status = "";
 		} catch (error) {
