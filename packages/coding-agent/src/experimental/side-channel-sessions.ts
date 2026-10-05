@@ -37,15 +37,14 @@ export function createSideChannelDeps(open: OpenSessionChannelServices): SideCha
  * client opens a session's services (`source.open({ services }).use(Service)`).
  */
 export interface SessionServiceSource {
-	open(options: { services: readonly unknown[]; sessionId?: string; onError?: (error: unknown) => void }): {
+	open(options: { services: readonly { readonly id: string }[]; assertAccess(): void; onError(error: Error): void }): {
 		use<T>(service: unknown): T;
 	};
 }
 
 export interface SessionServiceKeys {
-	readonly Questions: unknown;
-	readonly AgentController: unknown;
-	readonly AgentPromptImage?: unknown;
+	readonly Questions: { readonly id: string };
+	readonly AgentController: { readonly id: string };
 }
 
 /**
@@ -61,7 +60,7 @@ export function createSessionChannelOpener(
 	return (sessionId) => {
 		const services = source.open({
 			services: [keys.Questions, keys.AgentController],
-			sessionId,
+			assertAccess: () => {},
 			onError: () => {},
 		});
 		return {

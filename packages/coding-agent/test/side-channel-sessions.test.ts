@@ -44,7 +44,7 @@ describe("createSideChannelDeps", () => {
 });
 
 describe("createSessionChannelOpener", () => {
-	const keys = { Questions: "Q", AgentController: "AC" };
+	const keys = { Questions: { id: "Q" }, AgentController: { id: "AC" } };
 
 	function source(
 		questions: { answer: (text: string) => Promise<{ ok: boolean; error?: string }> },
@@ -60,7 +60,7 @@ describe("createSessionChannelOpener", () => {
 			open(options) {
 				openSpy?.(options);
 				return {
-					use: <T>(service: unknown): T => (service === "Q" ? questions : controller) as T,
+					use: <T>(service: unknown): T => ((service as { id?: string }).id === "Q" ? questions : controller) as T,
 				};
 			},
 		};
@@ -79,7 +79,7 @@ describe("createSessionChannelOpener", () => {
 		expect(await routeInboundChannelMessage({ channel: "im", sessionId: "s7", text: "yes" }, deps)).toEqual({
 			outcome: "answered",
 		});
-		expect(openSpy).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "s7" }));
+		expect(openSpy).toHaveBeenCalledWith(expect.objectContaining({ services: [{ id: "Q" }, { id: "AC" }] }));
 		expect(answer).toHaveBeenCalledWith("yes");
 	});
 
