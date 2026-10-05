@@ -74,6 +74,47 @@ export interface TuiMouseDispatchResult extends TuiMouseEventResult {
 	focusTarget?: Component;
 }
 
+/** Parsed mouse wheel sequence (SGR or legacy X10 encoding). */
+export interface ParsedWheel {
+	direction: -1 | 1;
+	button: number;
+	x: number;
+	y: number;
+}
+
+/**
+ * Parse a wheel escape sequence. Shared by every TUI mode so wheel behavior is uniform.
+ * Returns undefined for non-wheel input.
+ */
+export function parseWheelSequence(data: string): ParsedWheel | undefined {
+	const sgr = /^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/.exec(data);
+	if (sgr) {
+		const button = Number.parseInt(sgr[1]!, 10);
+		if ((button & 64) === 0) return undefined;
+		const direction = button & 3;
+		if (direction !== 0 && direction !== 1) return undefined;
+		return {
+			direction: direction === 0 ? -1 : 1,
+			button,
+			x: Number.parseInt(sgr[2]!, 10) - 1,
+			y: Number.parseInt(sgr[3]!, 10) - 1,
+		};
+	}
+	if (data.length === 6 && data.startsWith("\x1b[M")) {
+		const button = data.charCodeAt(3) - 32;
+		if ((button & 64) === 0) return undefined;
+		const direction = button & 3;
+		if (direction !== 0 && direction !== 1) return undefined;
+		return {
+			direction: direction === 0 ? -1 : 1,
+			button,
+			x: data.charCodeAt(4) - 33,
+			y: data.charCodeAt(5) - 33,
+		};
+	}
+	return undefined;
+}
+
 /**
  * Dispatch an event to a component and retain the exact target and coordinate
  * transform. Containers use this when forwarding events to nested children.
@@ -858,8 +899,15 @@ export abstract class TuiBase extends Container implements TUI {
 		return component;
 	}
 
-	/** Dispatch to the visually topmost overlay under the pointer. */
-	protected dispatchMouseToOverlay(event: TuiMouseEvent): { hit: boolean; result?: TuiMouseDispatchResult } {
+	/**
+	 * Dispatch to the visually topmost overlay under the pointer, returning the hit overlay entry so
+	 * callers can reason about containment (e.g. whether focus is inside that overlay).
+	 */
+	protected dispatchMouseToOverlay(event: TuiMouseEvent): {
+		hit: boolean;
+		entry?: OverlayStackEntry;
+		result?: TuiMouseDispatchResult;
+	} {
 		for (let index = this.renderedOverlayLayouts.length - 1; index >= 0; index--) {
 			const layout = this.renderedOverlayLayouts[index]!;
 			if (
@@ -880,11 +928,97 @@ export abstract class TuiBase extends Container implements TUI {
 			return result
 				? {
 						hit: true,
+						entry: layout.entry,
 						result: result.focus ? { ...result, focusTarget: layout.entry.component } : result,
 					}
-				: { hit: true };
+				: { hit: true, entry: layout.entry };
 		}
 		return { hit: false };
+	}
+
+	/**
+	 * How far one wheel notch scrolls, in logical lines (negative = up). Subclasses may accelerate
+	 * (alt-screen honours its `wheelScrollLines` setting and the Alt multiplier).
+	 */
+	protected wheelScrollDelta(_event: TuiMouseEvent, direction: -1 | 1): number {
+		return direction;
+	}
+
+	/**
+	 * Behavior for a wheel event that is not over any overlay. The default leaves it unconsumed;
+	 * subclasses route it to their scroll views or viewport.
+	 */
+	protected handleWheelOutsideOverlay(_event: TuiMouseEvent, _direction: -1 | 1, _delta: number): boolean {
+		return false;
+	}
+
+	/** Apply a resolved mouse dispatch (focus/capture/render). Shared by every TUI mode. */
+	protected applyMouseDispatchResult(event: TuiMouseEvent, result: TuiMouseDispatchResult): boolean {
+		const focusTarget = this.resolveMouseFocusTarget(result.focusTarget ?? result.target.component);
+		const focusChanged = result.focus === true && this.getFocusedComponent() !== focusTarget;
+		if (result.focus) this.setFocus(focusTarget);
+		return (
+			result.render ??
+			(focusChanged ||
+				event.type === "press" ||
+				event.type === "click" ||
+				event.type === "drag" ||
+				event.type === "wheel")
+		);
+	}
+
+	private createWheelEvent(wheel: ParsedWheel, delta: number): TuiMouseEvent {
+		return {
+			type: "wheel",
+			button: "none",
+			x: wheel.x,
+			y: wheel.y,
+			screenX: wheel.x,
+			screenY: wheel.y,
+			width: Math.max(1, this.terminal.columns),
+			height: Math.max(1, this.terminal.rows),
+			shift: (wheel.button & 4) !== 0,
+			alt: (wheel.button & 8) !== 0,
+			ctrl: (wheel.button & 16) !== 0,
+			wheelDelta: delta,
+		};
+	}
+
+	/** Send Up/Down key input for a wheel notch to a component that has no mouse handling. */
+	protected forwardWheelToComponent(target: Component, direction: number, lines: number): void {
+		if (!target.handleInput) return;
+		const key = direction < 0 ? "\x1b[A" : "\x1b[B";
+		const steps = Math.min(3, Math.max(1, Math.abs(lines)));
+		for (let i = 0; i < steps; i++) target.handleInput(key);
+		this.requestRender();
+	}
+
+	/**
+	 * The general wheel behavior, shared by every TUI mode:
+	 * 1. an overlay under the pointer consumes the wheel when it implements `handleMouse`;
+	 * 2. otherwise the wheel is forwarded to that overlay's focused child as Up/Down keys, so any
+	 *    dialog/list scrolls even without mouse support;
+	 * 3. a wheel outside every overlay falls through to `handleWheelOutsideOverlay`.
+	 * Returns true when the event was consumed.
+	 */
+	protected handleWheelInput(data: string): boolean {
+		const wheel = parseWheelSequence(data);
+		if (!wheel) return false;
+		const delta = this.wheelScrollDelta(this.createWheelEvent(wheel, 0), wheel.direction);
+		const event = this.createWheelEvent(wheel, delta);
+		const overlay = this.dispatchMouseToOverlay(event);
+		if (overlay.result) {
+			if (this.applyMouseDispatchResult(event, overlay.result)) this.requestRender();
+			return true;
+		}
+		if (overlay.entry) {
+			const target = this.getFocusedComponent();
+			if (target?.handleInput && this.containsComponent(overlay.entry.component, target)) {
+				this.forwardWheelToComponent(target, wheel.direction, delta);
+				return true;
+			}
+		}
+		return this.handleWheelOutsideOverlay(event, wheel.direction, delta);
 	}
 
 	/** Check if an overlay entry is currently visible */
@@ -1046,6 +1180,11 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 		if (this.consumeTerminalColorSchemeReport(data)) {
+			return;
+		}
+
+		// Wheel behavior is uniform across modes: overlays get it, otherwise the viewport does.
+		if (this.handleWheelInput(data)) {
 			return;
 		}
 

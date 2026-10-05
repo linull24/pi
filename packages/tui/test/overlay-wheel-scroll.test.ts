@@ -2,9 +2,19 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
-import type { TuiMouseEvent } from "../src/tui.ts";
+import { Container, type TuiMouseEvent } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
+import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
+
+class RecordingTerminal extends VirtualTerminal {
+	readonly writes: string[] = [];
+
+	override write(data: string): void {
+		this.writes.push(data);
+		super.write(data);
+	}
+}
 
 /** A focused modal overlay that handles keyboard input but has NO mouse handling. */
 class KeyboardOnlyOverlay {
@@ -111,6 +121,44 @@ describe("alt-screen wheel over a modal overlay", () => {
 
 		assert.ok(chat.scrollTop < before, `chat should scroll (was ${before}, now ${chat.scrollTop})`);
 		assert.deepStrictEqual(overlay.inputs, [], "the overlay must not receive keys for an outside wheel");
+		tui.stop();
+	});
+});
+
+describe("main-screen wheel over a modal overlay", () => {
+	it("enables mouse only while an overlay is visible and forwards the wheel inside it", async () => {
+		const terminal = new RecordingTerminal(40, 12);
+		const tui = new TuiMainScreen(terminal);
+		const root = new KeyboardOnlyOverlay();
+		tui.addChild(root);
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(
+			!terminal.writes.some((data) => data.includes("\x1b[?1000h")),
+			"mouse reporting must stay off while no overlay is visible",
+		);
+
+		const container = new Container();
+		const child = new KeyboardOnlyOverlay();
+		container.addChild(child);
+		tui.showOverlay(container);
+		tui.setFocus(child);
+		await terminal.waitForRender();
+		assert.ok(
+			terminal.writes.some((data) => data.includes("\x1b[?1000h")),
+			"mouse reporting must be enabled while a modal is visible",
+		);
+
+		// Inside the (screen-filling) overlay: forwarded as Up/Down keys to the focused child.
+		terminal.sendInput("\x1b[<65;20;6M");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(child.inputs, ["\x1b[B"]);
+
+		// Outside the overlay: page keys go to the mounted content instead.
+		terminal.sendInput("\x1b[<64;20;12M");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(child.inputs, ["\x1b[B"]);
+		assert.ok(root.inputs.includes("\x1b[5~"), "the mounted content should receive a page-up key");
 		tui.stop();
 	});
 });

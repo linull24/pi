@@ -2,11 +2,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { type TUI, TuiBase, type TuiMouseEvent, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
+/**
+ * Mouse reporting enabled only while an overlay is visible. Regular mode keeps the terminal's
+ * native scrollback (and selection) working the rest of the time.
+ */
+const ENABLE_OVERLAY_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
+const DISABLE_OVERLAY_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /**
  * Streams terminal output in 1 MiB chunks so a full render never forms one string large enough to exceed V8's limit.
@@ -131,6 +137,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	private overlayMouseEnabled = false;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -165,7 +172,33 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousViewportTop = 0;
 	}
 
+	/**
+	 * Mouse reporting is turned on only while an overlay (dialog/menu) is visible, so the terminal's
+	 * native scrollback/selection keeps working in regular mode the rest of the time.
+	 */
+	private syncOverlayMouseMode(): void {
+		const want = this.hasOverlayEntries;
+		if (want === this.overlayMouseEnabled) return;
+		this.overlayMouseEnabled = want;
+		this.terminal.write(want ? ENABLE_OVERLAY_MOUSE : DISABLE_OVERLAY_MOUSE);
+	}
+
+	/**
+	 * Wheel outside every overlay in regular mode: the transcript lives in the app viewport, so
+	 * forward the wheel as a page key to the content so the host app scrolls the conversation.
+	 */
+	protected override handleWheelOutsideOverlay(_event: TuiMouseEvent, direction: -1 | 1, _delta: number): boolean {
+		const key = direction < 0 ? "\x1b[5~" : "\x1b[6~";
+		for (const root of this.getMountedRoots()) root.handleInput?.(key);
+		this.requestRender();
+		return true;
+	}
+
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		if (this.overlayMouseEnabled) {
+			this.overlayMouseEnabled = false;
+			this.terminal.write(DISABLE_OVERLAY_MOUSE);
+		}
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;
@@ -246,6 +279,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected doRender(): void {
 		if (this.stopped) return;
+		this.syncOverlayMouseMode();
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;

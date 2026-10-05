@@ -662,18 +662,24 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
 	}
 
+	/** Alt-screen honours its wheel-line setting and the Alt multiplier for one notch. */
+	protected override wheelScrollDelta(event: TuiMouseEvent, direction: -1 | 1): number {
+		const lines = this.wheelScroll.next(direction, performance.now());
+		return event.alt ? direction * lines * ALT_WHEEL_SCROLL_MULTIPLIER : direction * lines;
+	}
+
 	/**
-	 * Wheel over a focused overlay whose component does not implement `handleMouse` (e.g. a modal
-	 * list or dialog): translate the wheel into Up/Down key input so it scrolls its content
-	 * instead of being swallowed. `lines` is the per-notch scroll amount from the wheel parser.
+	 * Wheel outside every overlay: a component under the pointer that implements `handleMouse` wins,
+	 * otherwise the scroll views under the pointer (and the primary viewport) scroll.
 	 */
-	private forwardWheelToOverlayComponent(direction: number, lines: number): void {
-		const target = this.getFocusedComponent();
-		if (!target?.handleInput) return;
-		const key = direction < 0 ? "\x1b[A" : "\x1b[B";
-		const count = Math.min(3, Math.max(1, Math.abs(lines)));
-		for (let i = 0; i < count; i++) target.handleInput(key);
-		this.requestRender();
+	protected override handleWheelOutsideOverlay(event: TuiMouseEvent, direction: -1 | 1, delta: number): boolean {
+		const result = this.dispatchMouseToLayout(event);
+		if (result) {
+			if (this.applyMouseDispatchResult(event, result)) this.requestRender();
+			return true;
+		}
+		this.routeWheel({ direction, x: event.x, y: event.y, button: 0 }, delta);
+		return true;
 	}
 
 	private clearComponentMouseGesture(): void {
@@ -708,30 +714,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		if (data === FOCUS_IN) return { consume: true };
 
-		const wheelEvent = this.parseWheelEvent(data);
-		if (wheelEvent) {
-			const lines = this.wheelScroll.next(wheelEvent.direction, performance.now());
-			// SGR mouse button codes use bit 3 (value 8) for the Alt modifier.
-			const wheelDelta =
-				wheelEvent.direction * ((wheelEvent.button & 8) !== 0 ? lines * ALT_WHEEL_SCROLL_MULTIPLIER : lines);
-			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, { wheelDelta });
-			const overlay = this.dispatchMouseToOverlay(event);
-			const result = overlay.result ?? (overlay.hit ? undefined : this.dispatchMouseToLayout(event));
-			if (result) {
-				if (this.applyMouseDispatchResult(event, result)) this.requestRender();
-				return { consume: true };
-			}
-			// Cursor inside a focused overlay that has no mouse handling (e.g. a modal dialog):
-			// forward the wheel to it as Up/Down keys instead of dropping it.
-			if (overlay.hit && this.isOverlayFocused()) {
-				this.forwardWheelToOverlayComponent(wheelEvent.direction, lines);
-				return { consume: true };
-			}
-			// Cursor outside every overlay: the wheel scrolls the conversation even while a modal
-			// is focused, so the transcript behind the dialog stays readable.
-			this.routeWheel(wheelEvent, wheelDelta);
-			return { consume: true };
-		}
 		const mouseEvent = this.parseSgrMouseEvent(data);
 		if (mouseEvent) {
 			this.handleMouseEvent(mouseEvent);
@@ -864,19 +846,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return undefined;
 	}
 
-	private applyMouseDispatchResult(event: TuiMouseEvent, result: TuiMouseDispatchResult): boolean {
-		const focusTarget = this.resolveMouseFocusTarget(result.focusTarget ?? result.target.component);
-		const focusChanged = result.focus === true && this.getFocusedComponent() !== focusTarget;
-		if (result.focus) this.setFocus(focusTarget);
+	protected override applyMouseDispatchResult(event: TuiMouseEvent, result: TuiMouseDispatchResult): boolean {
+		const render = super.applyMouseDispatchResult(event, result);
 		if (result.capture) this.mouseCapture = result.target;
-		return (
-			result.render ??
-			(focusChanged ||
-				event.type === "press" ||
-				event.type === "click" ||
-				event.type === "drag" ||
-				event.type === "wheel")
-		);
+		return render;
 	}
 
 	private dispatchMouseToTarget(
@@ -973,35 +946,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		if (this.handleRightClickPaste(raw)) return;
 		this.handleSelectionMouseEvent(raw);
-	}
-
-	private parseWheelEvent(data: string): WheelEvent | undefined {
-		const sgr = /^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/.exec(data);
-		if (sgr) {
-			const button = Number.parseInt(sgr[1], 10);
-			if ((button & 64) === 0) return undefined;
-			const direction = button & 3;
-			if (direction !== 0 && direction !== 1) return undefined;
-			return {
-				direction: direction === 0 ? -1 : 1,
-				x: Number.parseInt(sgr[2], 10) - 1,
-				y: Number.parseInt(sgr[3], 10) - 1,
-				button,
-			};
-		}
-		if (data.length === 6 && data.startsWith("\x1b[M")) {
-			const button = data.charCodeAt(3) - 32;
-			if ((button & 64) === 0) return undefined;
-			const direction = button & 3;
-			if (direction !== 0 && direction !== 1) return undefined;
-			return {
-				direction: direction === 0 ? -1 : 1,
-				x: data.charCodeAt(4) - 33,
-				y: data.charCodeAt(5) - 33,
-				button,
-			};
-		}
-		return undefined;
 	}
 
 	private routeWheel(event: WheelEvent, delta: number): void {
