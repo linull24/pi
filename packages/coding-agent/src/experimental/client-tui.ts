@@ -776,9 +776,9 @@ export class ExperimentalClientTui implements Component {
 		void this.#pruneEmptySessions();
 	}
 
-	/** pi (A) sessions passing the current-directory / query filters, newest first. */
+	/** pi (A) sessions in the current view, flattened for cursor navigation. */
 	#visibleSessions(): SessionEntry[] {
-		return this.#filterPiSessions();
+		return this.#sessionGroups().flatMap((group) => group.rows);
 	}
 
 	/** The single, stable C entry point ("captain"), when a C source is registered. */
@@ -786,17 +786,27 @@ export class ExperimentalClientTui implements Component {
 		return this.#listCEntries()[0];
 	}
 
-	/** Apply the all/this and query filters to pi's own sessions. */
-	#filterPiSessions(): SessionEntry[] {
-		const query = this.#sessionQuery.toLowerCase();
-		return this.#sessionItems
-			.filter((session) => this.#sessionAll || session.cwd === process.cwd())
-			.filter((session) => this.#matchesQuery(session, query))
-			.filter((session) => session.hasUser || session.sessionId === this.#sessionId)
-			.sort(
-				(left, right) =>
-					right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId),
-			);
+	/**
+	 * The list contents. No query: this project's sessions (or every project under Ctrl+A), sorted by
+	 * activity time. With a query: matches from the current project first, then global matches from
+	 * other projects — each group still activity-time sorted.
+	 */
+	#sessionGroups(): Array<{ label: string | undefined; rows: SessionEntry[] }> {
+		const byActivity = (left: SessionEntry, right: SessionEntry): number =>
+			right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId);
+		const owned = this.#sessionItems.filter((session) => session.hasUser || session.sessionId === this.#sessionId);
+		const query = this.#sessionQuery.trim().toLowerCase();
+		if (query.length === 0) {
+			const rows = owned.filter((session) => this.#sessionAll || session.cwd === process.cwd()).sort(byActivity);
+			return [{ label: undefined, rows }];
+		}
+		const matches = owned.filter((session) => this.#matchesQuery(session, query));
+		const local = matches.filter((session) => session.cwd === process.cwd()).sort(byActivity);
+		const global = matches.filter((session) => session.cwd !== process.cwd()).sort(byActivity);
+		const groups: Array<{ label: string | undefined; rows: SessionEntry[] }> = [];
+		if (local.length > 0) groups.push({ label: undefined, rows: local });
+		if (global.length > 0) groups.push({ label: `global · ${global.length}`, rows: global });
+		return groups;
 	}
 
 	/** Rows contributed by registered C sources (a single "captain" entry today), activity-time sorted. */
@@ -855,8 +865,26 @@ export class ExperimentalClientTui implements Component {
 			theme.fg("muted", `most active first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`) +
 			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "");
 		container.addChild(new Text(scope, 1, 0));
-		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
-		visible.forEach((session, index) => {
+		if (visible.length === 0) {
+			container.addChild(
+				new Text(theme.fg("muted", this.#sessionQuery.length > 0 ? "No matches" : "No sessions"), 1, 1),
+			);
+		}
+		// The list is its own box: it scrolls internally around the cursor instead of the whole page.
+		const rows: Array<{ session: SessionEntry; label: string | undefined }> = [];
+		for (const group of this.#sessionGroups()) {
+			for (const session of group.rows) rows.push({ session, label: group.label });
+		}
+		const maxRows = 12;
+		const start = Math.max(0, Math.min(this.#sessionIndex - Math.floor(maxRows / 2), rows.length - maxRows));
+		const end = Math.min(rows.length, start + maxRows);
+		if (start > 0) container.addChild(new Text(theme.fg("muted", "  ↑"), 1, 0));
+		for (let index = start; index < end; index++) {
+			const row = rows[index]!;
+			const session = row.session;
+			if (row.label !== undefined && rows[index - 1]?.label !== row.label) {
+				container.addChild(new Text(theme.fg("muted", `  ⟨${row.label}⟩`), 1, 0));
+			}
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
 			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
@@ -869,7 +897,8 @@ export class ExperimentalClientTui implements Component {
 				new Text(`${prefix}${agentStateTag(session.state)} ${selected ? theme.bold(name) : name}${current}`, 1, 0),
 			);
 			container.addChild(new Text(`     ${where} · ${age}${activity}`, 1, 0));
-		});
+		}
+		if (end < rows.length) container.addChild(new Text(theme.fg("muted", "  ↓"), 1, 0));
 		if (this.#sessionRenaming) {
 			container.addChild(new Text(theme.fg("accent", `Rename: ${this.#sessionRenameValue}▏`), 1, 1));
 		}
@@ -895,13 +924,13 @@ export class ExperimentalClientTui implements Component {
 		const composer =
 			this.#agentDispatch.length > 0
 				? this.#agentDispatch
-				: theme.fg("muted", "Describe a task to dispatch a new agent…");
+				: theme.fg("muted", "/dispatch <task> to launch an agent…");
 		container.addChild(new Text(`${theme.fg("accent", "❯")} ${composer}`, 1, 1));
 		container.addChild(
 			new Text(
 				theme.fg(
 					"muted",
-					"Ctrl+A all/this · Space peek · Enter attach · type to dispatch · /reply <answer> · /done · Ctrl+X stop · Esc exit",
+					"type to search · /dispatch <task> · Ctrl+A all/this · Space peek · Enter attach · /reply · /done · Ctrl+X stop · Esc exit",
 				),
 				1,
 				1,
@@ -956,8 +985,9 @@ export class ExperimentalClientTui implements Component {
 				void this.#answerQuestion(this.#selectedRow()?.sessionId, text.slice(7).trim());
 				return;
 			}
-			if (text.length > 0) {
-				void this.#dispatchAgent(text);
+			if (text.startsWith("/dispatch ")) {
+				this.#agentDispatch = "";
+				void this.#dispatchAgent(text.slice(10).trim());
 				return;
 			}
 			void this.#confirmSession();
@@ -985,9 +1015,24 @@ export class ExperimentalClientTui implements Component {
 			if (this.#agentDispatch.length === 0) this.#sessionPreview = !this.#sessionPreview;
 			else this.#agentDispatch += " ";
 		} else if (data === "\u007f") {
-			this.#agentDispatch = this.#agentDispatch.slice(0, -1);
+			if (this.#agentDispatch.length > 0) {
+				this.#agentDispatch = this.#agentDispatch.slice(0, -1);
+			} else {
+				this.#sessionQuery = this.#sessionQuery.slice(0, -1);
+				this.#sessionIndex = 0;
+				this.#captainSelected = false;
+			}
+		} else if (data === "/" && this.#agentDispatch.length === 0) {
+			this.#agentDispatch = "/";
 		} else if (data.length === 1 && data >= " ") {
-			this.#agentDispatch += data;
+			// Typing filters the list below (local matches first, then global); a leading "/" is a command.
+			if (this.#agentDispatch.startsWith("/")) {
+				this.#agentDispatch += data;
+			} else {
+				this.#sessionQuery += data;
+				this.#sessionIndex = 0;
+				this.#captainSelected = false;
+			}
 		}
 		this.#rebuild();
 	}
