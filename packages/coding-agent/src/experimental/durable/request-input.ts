@@ -9,6 +9,7 @@
 
 import { defineDoc, defineExtension, defineTool, type Extension } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
+import { emitAgentNotification } from "../notify.ts";
 
 type QuestionState = {
 	status: "idle" | "pending" | "answered";
@@ -68,6 +69,7 @@ export const RequestInput: Extension = defineExtension({
 					doc.askedAt = Date.now();
 					doc.answeredAt = 0;
 				}, context);
+				emitAgentNotification({ kind: "needs-input", title: "pi agent needs input", message: args.question });
 
 				const deadline = Date.now() + WAIT_TIMEOUT_MS;
 				while (Date.now() < deadline) {

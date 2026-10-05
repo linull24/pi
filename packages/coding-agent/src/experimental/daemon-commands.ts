@@ -12,6 +12,7 @@
 
 import chalk from "chalk";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
+import { listAgentSessions } from "./agent-sessions.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
 import { runClientCommand } from "./commands.ts";
 
@@ -76,6 +77,17 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 
 	try {
 		if (command === "agents") {
+			const rest = args.slice(1);
+			if (rest.includes("--json")) {
+				// Scriptable session list (Claude parity: `claude agents --json`).
+				const sessions = listAgentSessions();
+				const active = sessions.filter(
+					(session) =>
+						session.state === "working" || session.state === "needs-input" || session.state === "finishing",
+				);
+				console.log(JSON.stringify(rest.includes("--all") ? sessions : active, null, 2));
+				return true;
+			}
 			// Same Agent View as pressing ← inside a session (Claude/Codex parity).
 			await runClientCommand({ command: "client", agents: true });
 			return true;

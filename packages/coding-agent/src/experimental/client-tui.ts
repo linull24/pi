@@ -34,6 +34,7 @@ import { InteractiveThemeController } from "../modes/interactive/theme/theme-con
 import { createInteractiveTui } from "../modes/interactive/tui-renderer.ts";
 import { type OpenClientRuntimeOptions, openClientRuntime } from "./client-runtime.ts";
 import { ExperimentalChatView, liveOf } from "./client-tui-chat.ts";
+import { emitAgentNotification } from "./notify.ts";
 import { createPresentationFacetLoaders } from "./plugins/bundled.ts";
 import { AgentController, type AgentOperationResponse, type AgentQueueResponse } from "./services/agent-controller.ts";
 import type {
@@ -268,6 +269,7 @@ export class ExperimentalClientTui implements Component {
 	#agentDispatch = "";
 	#needsInput = 0;
 	#agentPollTimer: ReturnType<typeof setInterval> | undefined;
+	#agentStates = new Map<string, AgentRowState>();
 	#documentHidden = false;
 
 	private constructor(
@@ -1000,6 +1002,40 @@ export class ExperimentalClientTui implements Component {
 		const tick = (): void => {
 			try {
 				const items = this.#listSessions();
+				// Notify on lifecycle transitions (needs input / finished / failed).
+				for (const session of items) {
+					const previous = this.#agentStates.get(session.sessionId);
+					if (previous !== undefined && previous !== session.state) {
+						if (session.state === "needs-input")
+							emitAgentNotification({
+								kind: "needs-input",
+								title: "pi agent needs input",
+								message: session.question ?? session.title,
+								sessionId: session.sessionId,
+								cwd: session.cwd,
+							});
+						else if (session.state === "failed")
+							emitAgentNotification({
+								kind: "failed",
+								title: "pi agent failed",
+								message: session.title,
+								sessionId: session.sessionId,
+								cwd: session.cwd,
+							});
+						else if (
+							session.state === "needs-instructions" &&
+							(previous === "working" || previous === "finishing")
+						)
+							emitAgentNotification({
+								kind: "finished",
+								title: "pi agent finished",
+								message: session.title,
+								sessionId: session.sessionId,
+								cwd: session.cwd,
+							});
+					}
+					this.#agentStates.set(session.sessionId, session.state);
+				}
 				const needs = items.filter((session) => session.state === "needs-input").length;
 				if (needs !== this.#needsInput) {
 					this.#needsInput = needs;
