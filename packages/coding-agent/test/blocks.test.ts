@@ -7,14 +7,21 @@ import { createFileBlockStore, readIndex, rebuildIndex } from "../src/experiment
 import { createMentionRouter, postMentionedBlock, subagentMentionTarget } from "../src/experimental/block-triggers.ts";
 import {
 	childrenOf,
+	commit,
 	createBlock,
 	createMemoryBlockStore,
+	fulfil,
 	mention,
 	mentioning,
+	openCommitments,
 	query,
 	refer,
+	referencedIds,
 	referrersOf,
+	release,
+	resolveReferences,
 	updateBlock,
+	violate,
 } from "../src/experimental/blocks.ts";
 
 const roots: string[] = [];
@@ -195,5 +202,43 @@ describe("session binding (the whole A2A surface)", () => {
 		expect(binding.inbox().map((b) => b.body)).toEqual(["ping"]);
 
 		expect(binding.close(note.id).status).toBe("closed");
+	});
+});
+
+describe("commitments (not evidence)", () => {
+	it("undertakes, fulfils, releases and violates with a public counterparty", () => {
+		const store = createMemoryBlockStore();
+		const c = commit(store, { body: "ship the gateway", author: "session:s1", to: "captain", due: 123 });
+		expect(c.kind).toBe("commitment");
+		expect(c.mentions).toEqual(["@captain"]);
+		expect(openCommitments(store, "@captain").map((b) => b.id)).toEqual([c.id]);
+
+		const work = createBlock(store, { kind: "turn", body: "done", author: "session:s1" });
+		const fulfilled = fulfil(store, c.id, work.id);
+		expect(fulfilled.props.status).toBe("fulfilled");
+		expect(store.get(work.id)?.refs).toEqual([{ to: c.id, rel: "fulfil" }]);
+		expect(openCommitments(store)).toHaveLength(0);
+
+		const other = commit(store, { body: "x", author: "session:s1", to: "@bob" });
+		expect(release(store, other.id, "no longer needed").props.status).toBe("released");
+		const third = commit(store, { body: "y", author: "session:s1", to: "@bob" });
+		expect(violate(store, third.id, "missed").props.status).toBe("violated");
+	});
+});
+
+describe("inline [[block]] references", () => {
+	it("finds referenced ids and expands them to real content (no copying)", () => {
+		const store = createMemoryBlockStore();
+		const target = createBlock(store, { kind: "note", body: "the payload", author: "session:s1" });
+		const body = `see [[block:${target.id}]] and [[${target.id}]]`;
+		expect(referencedIds(body)).toEqual([target.id]);
+		const resolved = resolveReferences(store, body);
+		expect(resolved).toContain("the payload");
+		expect(resolved.match(/the payload/g)?.length).toBe(2);
+	});
+
+	it("leaves a missing reference untouched", () => {
+		const store = createMemoryBlockStore();
+		expect(resolveReferences(store, "[[block:b_missing]]")).toBe("[[block:b_missing]]");
 	});
 });

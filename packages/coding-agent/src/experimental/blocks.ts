@@ -16,7 +16,7 @@ export type BlockKind =
 	| "conversation"
 	| "turn"
 	| "instruction"
-	| "evidence"
+	| "commitment"
 	| "plan"
 	| "plan-step"
 	| "note"
@@ -27,6 +27,10 @@ export type RelationType =
 	| "refer"
 	| "at"
 	| "cites"
+	| "commit"
+	| "fulfil"
+	| "release"
+	| "violate"
 	| "derives"
 	| "answers"
 	| "supersedes"
@@ -269,4 +273,111 @@ export function createMemoryBlockStore(initial: readonly Block[] = []): BlockSto
 		put: (block) => void map.set(block.id, block),
 		list: () => [...map.values()],
 	};
+}
+
+// ── Commitments (the replacement for `evidence`) ────────────────────────────────────────────────
+//
+// A commitment is an undertaking with a counterparty and a lifecycle — who owes what to whom — not a
+// proof file. The counterparty is a **public** `@`-mention; the work that satisfies it links back.
+
+export type CommitmentStatus = "open" | "fulfilled" | "released" | "violated";
+
+export interface CommitInput {
+	readonly body: string;
+	readonly author: string;
+	/** The counterparty, `@name` or `name` (public mention). */
+	readonly to: string;
+	readonly due?: number;
+	readonly parent?: string | null;
+	readonly props?: Readonly<Record<string, unknown>>;
+}
+
+/** Undertake a commitment toward `to`. */
+export function commit(store: BlockStore, input: CommitInput, now = Date.now()): Block {
+	const block = createBlock(store, {
+		kind: "commitment",
+		body: input.body,
+		author: input.author,
+		parent: input.parent ?? null,
+		mentions: [input.to.startsWith("@") ? input.to : `@${input.to}`],
+		refs: [],
+		props: {
+			status: "open" satisfies CommitmentStatus,
+			...(input.due === undefined ? {} : { due: input.due }),
+			...(input.props ?? {}),
+		},
+		now,
+	});
+	return block;
+}
+
+function setCommitmentStatus(
+	store: BlockStore,
+	id: string,
+	status: CommitmentStatus,
+	now: number,
+	note?: string,
+): Block {
+	const block = store.get(id);
+	if (block === undefined) throw new Error(`commitment: unknown block ${id}`);
+	return updateBlock(
+		store,
+		id,
+		{ status: status === "violated" ? "closed" : "open", props: { status, ...(note === undefined ? {} : { note }) } },
+		now,
+	);
+}
+
+/** Mark a commitment fulfilled; link the satisfying work with `fulfil`. */
+export function fulfil(store: BlockStore, id: string, byId?: string, now = Date.now()): Block {
+	const block = setCommitmentStatus(store, id, "fulfilled", now);
+	if (byId !== undefined) refer(store, byId, id, "fulfil");
+	return block;
+}
+
+/** Release a commitment (no longer owed). */
+export function release(store: BlockStore, id: string, reason?: string, now = Date.now()): Block {
+	return setCommitmentStatus(store, id, "released", now, reason);
+}
+
+/** Record a violated commitment. */
+export function violate(store: BlockStore, id: string, reason?: string, now = Date.now()): Block {
+	return setCommitmentStatus(store, id, "violated", now, reason);
+}
+
+/** Open commitments, optionally those made to a target. */
+export function openCommitments(store: BlockStore, to?: string): readonly Block[] {
+	const handle = to === undefined ? undefined : to.startsWith("@") ? to : `@${to}`;
+	// "open" is the commitment's own props.status, not the block status (a fulfilled block stays open).
+	return query(store, { kind: "commitment" }).filter(
+		(block) => block.props.status === "open" && (handle === undefined || block.mentions.includes(handle)),
+	);
+}
+
+// ── Inline `[[block]]` references (pass content, never copy) ─────────────────────────────────────
+
+/** `[[block:<id>]]` or `[[<id>]]` inside a body. */
+export const BLOCK_REF_PATTERN = /\[\[(?:block:)?(b_[A-Za-z0-9]+)\]\]/g;
+
+/** The block ids referenced inline in a body, in order, deduplicated. */
+export function referencedIds(body: string): string[] {
+	const ids: string[] = [];
+	for (const match of body.matchAll(BLOCK_REF_PATTERN)) {
+		const id = match[1];
+		if (id !== undefined && !ids.includes(id)) ids.push(id);
+	}
+	return ids;
+}
+
+/**
+ * Expand inline `[[block]]` references to the referenced block's body so a peer gets the content by
+ * reference rather than by copy. `depth` bounds recursion; a missing/cyclic ref is left as-is.
+ */
+export function resolveReferences(store: BlockStore, body: string, depth = 3): string {
+	if (depth <= 0) return body;
+	return body.replace(BLOCK_REF_PATTERN, (whole, id: string) => {
+		const target = store.get(id);
+		if (target === undefined) return whole;
+		return `\n--- [[${id}]] ---\n${resolveReferences(store, target.body, depth - 1)}\n--- /[[${id}]] ---\n`;
+	});
 }
