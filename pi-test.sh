@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# We deliberately stay on the fork, so never print the "Update Available" notice.
+export PI_SKIP_VERSION_CHECK="${PI_SKIP_VERSION_CHECK:-1}"
+
 # Check for --no-env flag
 NO_ENV=false
 ARGS=()
