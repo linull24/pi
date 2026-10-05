@@ -17,11 +17,38 @@ import type { ToolDefinition } from "../../core/extensions/types.ts";
 import { type BlackboardBinding, bindSession } from "../../experimental/block-session.ts";
 import { createFileBlockStore } from "../../experimental/block-store.ts";
 import { createMentionRouter } from "../../experimental/block-triggers.ts";
-import { mention as addMention, nest as nestBlock, query as queryBlocks, refer } from "../../experimental/blocks.ts";
+import {
+	mention as addMention,
+	commit,
+	fulfil,
+	nest as nestBlock,
+	query as queryBlocks,
+	refer,
+	release,
+	resolveReferences,
+	updateBlock,
+	violate,
+} from "../../experimental/blocks.ts";
 
 export const BLOCK_TOOL_NAME = "block";
 
-const ACTIONS = ["post", "ask", "nest", "refer", "mention", "query", "inbox", "close", "get"] as const;
+const ACTIONS = [
+	"post",
+	"ask",
+	"nest",
+	"refer",
+	"mention",
+	"query",
+	"inbox",
+	"close",
+	"get",
+	"commit",
+	"fulfil",
+	"release",
+	"violate",
+	"update",
+	"delete",
+] as const;
 
 const BlockParams = Type.Object({
 	action: Type.String({ description: `One of: ${ACTIONS.join(", ")}` }),
@@ -205,7 +232,51 @@ export function createBlockToolDefinition(): ToolDefinition<typeof BlockParams> 
 				case "get": {
 					if (args.id === undefined) return text("get needs id");
 					const block = store.get(args.id);
-					return text(block === undefined ? `no block ${args.id}` : JSON.stringify(block, null, "\t"));
+					if (block === undefined) return text(`no block ${args.id}`);
+					// Inline [[block]] references are expanded so the caller gets content, not a pointer.
+					return text(JSON.stringify({ ...block, body: resolveReferences(store, block.body) }, null, "\t"));
+				}
+				case "commit": {
+					if (args.to === undefined) return text("commit needs to (the counterparty, @name or name)");
+					const block = commit(store, {
+						body: args.body ?? "",
+						author: `session:${process.env.PI_SESSION_ID ?? "session"}`,
+						to: args.to,
+						...(args.parent === undefined ? {} : { parent: args.parent }),
+						...(args.id === undefined ? {} : { props: { due: Number(args.id) || undefined } }),
+					});
+					return text(`committed ${block.id} to ${block.mentions.join(", ")} (status: open)`);
+				}
+				case "fulfil": {
+					if (args.id === undefined) return text("fulfil needs id");
+					const block = fulfil(store, args.id, args.to);
+					return text(`commitment ${block.id} -> ${String(block.props.status)}`);
+				}
+				case "release": {
+					if (args.id === undefined) return text("release needs id");
+					const block = release(store, args.id, args.body);
+					return text(`commitment ${block.id} -> ${String(block.props.status)}`);
+				}
+				case "violate": {
+					if (args.id === undefined) return text("violate needs id");
+					const block = violate(store, args.id, args.body);
+					return text(`commitment ${block.id} -> ${String(block.props.status)}`);
+				}
+				case "update": {
+					if (args.id === undefined) return text("update needs id");
+					const block = updateBlock(store, args.id, {
+						...(args.body === undefined ? {} : { body: args.body }),
+						...(args.title === undefined ? {} : { title: args.title }),
+						...(args.kind === undefined ? {} : { props: { kindHint: args.kind } }),
+					});
+					return text(`updated ${block.id} (revision ${block.revision})`);
+				}
+				case "delete": {
+					if (args.id === undefined) return text("delete needs id");
+					// Soft delete: the block stays on the blackboard with status "deleted" (tombstone),
+					// so references to it do not dangle. Use `update` to change content instead.
+					const block = updateBlock(store, args.id, { status: "deleted" });
+					return text(`deleted ${block.id} (tombstone; ${block.refs.length} refs kept)`);
 				}
 				default:
 					return text(`unknown action ${args.action}`);
