@@ -572,6 +572,18 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	// Native daemon subcommands (`pi server|client|agents|resume|queue`). Loaded lazily so the default
+	// `pi` entry graph stays lean and the daemon graph is not evaluated for normal sessions.
+	if (
+		args[0] === "server" ||
+		args[0] === "client" ||
+		args[0] === "agents" ||
+		args[0] === "resume" ||
+		args[0] === "queue"
+	) {
+		const { runDaemonCli } = await import("./cli/daemon.ts");
+		if (await runDaemonCli(args)) return;
+	}
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
