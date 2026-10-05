@@ -20,6 +20,7 @@ import { Check } from "typebox/value";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
+import { installExtensionTools } from "./durable/extension-tools.ts";
 import {
 	configureHarnessHttp,
 	createCodingRegistry,
@@ -784,6 +785,7 @@ async function createCodingAgentHarness(
 	try {
 		const registry = createCodingRegistry(settingsManager, cwd);
 		registry.install(Subagent);
+		await installExtensionTools(registry, settingsManager, cwd, modelRuntime);
 		harness = await Harness.open(
 			await openNodeSqliteStorage(databasePath),
 			{
