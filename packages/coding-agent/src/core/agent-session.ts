@@ -3636,6 +3636,21 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 
+		// Reload is the one place where tools can appear out of nowhere: a package was just installed
+		// or updated on disk. The rebuilt registry can hold declarable extension tools that the active
+		// set does not know about yet, so diff registry vs active and activate the additions —
+		// otherwise a freshly installed tool (e.g. TaskList) stays invisible to the model until the
+		// process restarts. This is deliberately additive: nothing already active is dropped, and the
+		// checkpoint/rollback path is untouched.
+		const activeAfterReload = this.getActiveToolNames();
+		const activeNames = new Set(activeAfterReload);
+		const newlyDeclarable = [...this._toolRegistry.keys()].filter(
+			(name) => !activeNames.has(name) && this._isAllowedTool(name) && this._isDeclarable(name),
+		);
+		if (newlyDeclarable.length > 0) {
+			this.setActiveToolsByName([...activeAfterReload, ...newlyDeclarable]);
+		}
+
 		const hasBindings =
 			this._extensionUIContext ||
 			this._extensionCommandContextActions ||
