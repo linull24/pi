@@ -8,7 +8,11 @@
  * The channel adapter is injectable so the wiring can be tested without a network.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createQqBotAdapter } from "./channels/qq.ts";
 import { openClientRuntime } from "./client-runtime.ts";
 import { AgentController } from "./services/agent-controller.ts";
@@ -40,6 +44,39 @@ export interface CaptainConfig {
 export interface CaptainDeps {
 	readonly sideChannel: SideChannelDeps;
 	log?(message: string): void;
+}
+
+/**
+ * Newest durable session that already has a user turn — captain's default target ("the active A").
+ * Kept filesystem-only so `pi captain` does not need the whole client TUI.
+ */
+export function newestSessionFromDisk(): string | undefined {
+	const root = path.join(getAgentDir(), "experimental", "sessions");
+	let ids: string[];
+	try {
+		ids = fs.readdirSync(root);
+	} catch {
+		return undefined;
+	}
+	const candidates: Array<{ id: string; at: number }> = [];
+	for (const id of ids) {
+		try {
+			const dbPath = path.join(root, id, "session.sqlite");
+			const db = new DatabaseSync(dbPath, { readOnly: true });
+			try {
+				const row = db
+					.prepare("select count(*) as c from entries where json_extract(record,'$.kind')='pi.user'")
+					.get() as unknown as { c?: number };
+				if ((row?.c ?? 0) > 0) candidates.push({ id, at: fs.statSync(dbPath).mtimeMs });
+			} finally {
+				db.close();
+			}
+		} catch {
+			// skip unreadable session
+		}
+	}
+	candidates.sort((left, right) => right.at - left.at || left.id.localeCompare(right.id));
+	return candidates[0]?.id;
 }
 
 /** Read the QQ credentials captain needs. Returns undefined when they are not configured. */
@@ -108,7 +145,7 @@ export async function runCaptain(
 ): Promise<void> {
 	const env = options.env ?? process.env;
 	const log = options.log ?? ((message: string) => console.log(message));
-	const sessionId = options.sessionId ?? env.PI_CAPTAIN_SESSION;
+	const sessionId = options.sessionId ?? env.PI_CAPTAIN_SESSION ?? newestSessionFromDisk();
 	if (sessionId === undefined || sessionId.length === 0) {
 		throw new Error("captain needs a target session (set PI_CAPTAIN_SESSION)");
 	}

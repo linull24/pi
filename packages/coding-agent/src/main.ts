@@ -572,6 +572,14 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	// `pi captain` — the persistent C gateway (QQ in/out, side channel to the active session).
+	// Loaded lazily like the daemon subcommands so the default entry graph stays lean.
+	if (args[0] === "captain") {
+		const { runCaptain } = await import("./experimental/captain.ts");
+		const explicit = args[1] !== undefined && !args[1].startsWith("-") ? args[1] : undefined;
+		await runCaptain({ sessionId: explicit });
+		return;
+	}
 	// Native daemon subcommands (`pi server|client|agents|resume|queue`). Loaded lazily so the default
 	// `pi` entry graph stays lean and the daemon graph is not evaluated for normal sessions.
 	if (
