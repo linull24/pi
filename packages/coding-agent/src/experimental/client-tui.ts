@@ -274,6 +274,9 @@ export class ExperimentalClientTui implements Component {
 	#agentPollTimer: ReturnType<typeof setInterval> | undefined;
 	#agentStates = new Map<string, AgentRowState>();
 	#goal: string | undefined;
+	#hints: string[] = [];
+	#hintIndex = 0;
+	#hintLoading = false;
 	#documentHidden = false;
 
 	private constructor(
@@ -387,6 +390,11 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		if (this.#screen === "chat") {
+			// Tab: propose the user's likely next replies (the `hint` role).
+			if ((data === "\t" || data === "\u0009") && this.#chatInput.getText().length === 0) {
+				void this.#tabHint();
+				return;
+			}
 			// ← on an empty editor opens the all-sessions overview (Claude Code-style switch).
 			if (!this.#busy && (data === "\u001b[D" || data === "\u001bOD") && this.#chatInput.getText().length === 0) {
 				this.#openSessionOverview();
@@ -910,6 +918,9 @@ export class ExperimentalClientTui implements Component {
 		} else if (data === "\u0018") {
 			void this.#stopAgent();
 			return;
+		} else if (data === "\t" || data === "\u0009") {
+			void this.#tabHint();
+			return;
 		} else if (data === " ") {
 			if (this.#agentDispatch.length === 0) this.#sessionPreview = !this.#sessionPreview;
 			else this.#agentDispatch += " ";
@@ -1085,6 +1096,13 @@ export class ExperimentalClientTui implements Component {
 							});
 					}
 					this.#agentStates.set(session.sessionId, session.state);
+					// After a turn ends, pre-generate hints for the current session.
+					if (
+						session.sessionId === this.#sessionId &&
+						session.state === "needs-instructions" &&
+						(previous === "working" || previous === "finishing")
+					)
+						void this.#generateHints();
 				}
 				const needs = items.filter((session) => session.state === "needs-input").length;
 				if (needs !== this.#needsInput) {
@@ -1261,6 +1279,137 @@ export class ExperimentalClientTui implements Component {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
 		this.#sessionItems = this.#listSessions();
+		this.#rebuild();
+	}
+
+	/** The hint model: the `hint` role from agent-config (mirrors the goal supervisor), env override. */
+	#hintModel(): string {
+		if (process.env.PI_HINT_MODEL !== undefined && process.env.PI_HINT_MODEL.length > 0)
+			return process.env.PI_HINT_MODEL;
+		try {
+			const config = JSON.parse(readFileSync(join(getAgentDir(), "agent-config.json"), "utf-8")) as {
+				roles?: Record<string, { model?: string[] }>;
+			};
+			const model = config.roles?.hint?.model?.[0];
+			if (typeof model === "string" && model.length > 0) return model;
+		} catch {
+			// fall through to the default
+		}
+		return "deepseek/deepseek-flash";
+	}
+
+	/** A bounded plain-text view of the current session's recent durable entries. */
+	#recentTranscript(maxChars = 4000): string {
+		if (this.#sessionId === undefined) return "";
+		try {
+			const db = new DatabaseSync(
+				join(getAgentDir(), "experimental", "sessions", this.#sessionId, "session.sqlite"),
+				{ readOnly: true },
+			);
+			try {
+				const rows = db
+					.prepare(
+						"select json_extract(record,'$.kind') as kind, record from entries where json_extract(record,'$.kind') in ('pi.user','pi.assistant') order by id desc limit 12",
+					)
+					.all() as unknown as Array<{ kind?: string; record?: string }>;
+				const lines = rows
+					.reverse()
+					.map((row) => {
+						const text = row.record === undefined ? "" : extractText(parseRecordContent(row.record));
+						return `${row.kind === "pi.user" ? "user" : "assistant"}: ${text.replace(/\s+/gu, " ").trim()}`;
+					})
+					.filter((line) => line.length > 6);
+				const joined = lines.join("\n");
+				return joined.length > maxChars ? joined.slice(joined.length - maxChars) : joined;
+			} finally {
+				db.close();
+			}
+		} catch {
+			return "";
+		}
+	}
+
+	/** Tab: generate hints once, then cycle them into the composer. */
+	async #tabHint(): Promise<void> {
+		if (this.#hints.length === 0 || this.#hintLoading) {
+			await this.#generateHints();
+			return;
+		}
+		this.#hintIndex = (this.#hintIndex + 1) % this.#hints.length;
+		this.#applyHint();
+		this.#rebuild();
+	}
+
+	#applyHint(): void {
+		const hint = this.#hints[this.#hintIndex];
+		if (hint === undefined) return;
+		if (this.#screen === "sessions") this.#agentDispatch = hint;
+		else if (this.#screen === "chat") this.#chatInput.setText(hint);
+	}
+
+	/** Ask the `hint` model for the user's likely next replies and cache them. */
+	async #generateHints(): Promise<void> {
+		if (this.#hintLoading) return;
+		this.#hintLoading = true;
+		this.#status = "hint: thinking…";
+		this.#rebuild();
+		try {
+			const prompt = [
+				"You are the hint role. Propose the user's most likely next replies for this session.",
+				"Return ONLY a JSON array of up to 3 short strings (ready-to-send user messages, no prose).",
+				"",
+				this.#recentTranscript(),
+			].join("\n");
+			const launcher = join(getAgentDir(), "bin", "pi");
+			const out = await new Promise<string>((done) => {
+				execFile(
+					launcher,
+					[
+						"--mode",
+						"json",
+						"-p",
+						"--no-session",
+						"--no-extensions",
+						"--no-tools",
+						"--model",
+						this.#hintModel(),
+						prompt,
+					],
+					{ maxBuffer: 8 * 1024 * 1024 },
+					(error, stdout) => done(error === null ? stdout : ""),
+				);
+			});
+			// Collect assistant text from the JSON stream.
+			let text = "";
+			for (const line of out.split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith("{")) continue;
+				try {
+					const event = JSON.parse(trimmed) as { message?: { role?: string; content?: unknown } };
+					if (event.message?.role !== "assistant" || !Array.isArray(event.message.content)) continue;
+					const part = event.message.content
+						.filter((b) => b && typeof b === "object" && (b as { type?: string }).type === "text")
+						.map((b) => (b as { text?: string }).text ?? "")
+						.join("");
+					if (part.trim().length > 0) text = part;
+				} catch {
+					// ignore
+				}
+			}
+			const match = /\[[\s\S]*\]/.exec(text);
+			this.#hints = [];
+			if (match) {
+				const parsed = JSON.parse(match[0]) as unknown;
+				if (Array.isArray(parsed))
+					this.#hints = parsed.filter((x): x is string => typeof x === "string").slice(0, 3);
+			}
+			this.#hintIndex = 0;
+			this.#status = this.#hints.length > 0 ? `hint: ${this.#hints[0]}` : "hint: none";
+			this.#applyHint();
+		} catch (error) {
+			this.#status = `hint failed: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		this.#hintLoading = false;
 		this.#rebuild();
 	}
 
