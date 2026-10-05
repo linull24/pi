@@ -14,6 +14,7 @@
 
 - Codemode `image()` now also saves each image to a temp file and names the path in the result, so later turns can copy or move generated images ([#10310](https://github.com/earendil-works/pi/issues/10310))
 - Output files (full text of truncated tool output, binary MCP resources, codemode images) are now readable only by the user
+- `Home`/`End` now always move the editor cursor to the line start/end; fullscreen transcript top/bottom moved to `Ctrl+Home`/`Ctrl+End`, which no longer move the editor cursor ([#10314](https://github.com/earendil-works/pi/issues/10314))
 
 ### Fixed
 
