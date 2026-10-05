@@ -101,6 +101,7 @@ type AgentRowState = "working" | "needs-input" | "needs-instructions" | "finishi
 type SessionEntry = {
 	readonly sessionId: string;
 	readonly createdAt: number;
+	readonly lastActivityAt: number;
 	readonly cwd: string;
 	readonly title: string;
 	readonly activity: string;
@@ -654,11 +655,19 @@ export class ExperimentalClientTui implements Component {
 				let activity = "";
 				let entries = 0;
 				let bytes = 0;
+				let lastActivityAt = meta.createdAt ?? 0;
 				let state: AgentRowState = "needs-instructions";
 				let question: string | undefined;
 				try {
 					const dbPath = join(dir, "session.sqlite");
 					bytes = statSync(dbPath).size;
+					// Activity = most recent write to the durable store (sqlite and its WAL).
+					lastActivityAt = statSync(dbPath).mtimeMs;
+					try {
+						lastActivityAt = Math.max(lastActivityAt, statSync(`${dbPath}-wal`).mtimeMs);
+					} catch {
+						// no WAL
+					}
 					const db = new DatabaseSync(dbPath, { readOnly: true });
 					try {
 						const firstUser = db
@@ -726,6 +735,7 @@ export class ExperimentalClientTui implements Component {
 				sessions.push({
 					sessionId: id,
 					createdAt: meta.createdAt ?? 0,
+					lastActivityAt,
 					cwd: meta.cwd ?? "",
 					title,
 					activity,
@@ -772,7 +782,10 @@ export class ExperimentalClientTui implements Component {
 					(session.name?.toLowerCase().includes(query) ?? false),
 			)
 			.filter((session) => session.hasUser || session.sessionId === this.#sessionId)
-			.sort((left, right) => right.createdAt - left.createdAt || left.sessionId.localeCompare(right.sessionId));
+			.sort(
+				(left, right) =>
+					right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId),
+			);
 	}
 
 	#renderSessionOverview(): Container {
@@ -784,7 +797,7 @@ export class ExperimentalClientTui implements Component {
 			theme.fg("accent", "Agents") +
 			theme.fg("muted", `  ${scoped.length} session${scoped.length === 1 ? "" : "s"}`) +
 			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "") +
-			theme.fg("muted", ` · newest first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
+			theme.fg("muted", ` · most active first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
 		container.addChild(new Text(header, 1, 1));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
 		visible.slice(0, 20).forEach((session, index) => {
@@ -792,7 +805,7 @@ export class ExperimentalClientTui implements Component {
 			const name = this.#sessionName(session);
 			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
 			const where = theme.fg("muted", shortenPath(session.cwd) || "?");
-			const age = theme.fg("muted", relativeTime(session.createdAt));
+			const age = theme.fg("muted", relativeTime(session.lastActivityAt));
 			const activity =
 				session.activity.length > 0 && session.activity !== name ? theme.fg("muted", `  ${session.activity}`) : "";
 			const prefix = selected ? `${theme.fg("accent", "❯")} ` : "  ";

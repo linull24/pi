@@ -14,6 +14,8 @@ export type AgentSessionState = "working" | "needs-input" | "needs-instructions"
 export interface AgentSessionInfo {
 	readonly sessionId: string;
 	readonly createdAt: number;
+	/** Last activity (most recent durable write), used for ordering. */
+	readonly lastActivityAt: number;
 	readonly cwd: string;
 	readonly name?: string;
 	readonly title: string;
@@ -74,11 +76,19 @@ export function listAgentSessions(): AgentSessionInfo[] {
 			let activity = "";
 			let entries = 0;
 			let bytes = 0;
+			let lastActivityAt = meta.createdAt ?? 0;
 			let state: AgentSessionState = "needs-instructions";
 			let question: string | undefined;
 			try {
 				const dbPath = join(dir, "session.sqlite");
 				bytes = statSync(dbPath).size;
+				// Activity = most recent write to the durable store (sqlite and its WAL).
+				lastActivityAt = statSync(dbPath).mtimeMs;
+				try {
+					lastActivityAt = Math.max(lastActivityAt, statSync(`${dbPath}-wal`).mtimeMs);
+				} catch {
+					// no WAL
+				}
 				const db = new DatabaseSync(dbPath, { readOnly: true });
 				try {
 					const firstUser = db
@@ -134,6 +144,7 @@ export function listAgentSessions(): AgentSessionInfo[] {
 			sessions.push({
 				sessionId: id,
 				createdAt: meta.createdAt ?? 0,
+				lastActivityAt,
 				cwd: meta.cwd ?? "",
 				...(meta.name === undefined ? {} : { name: meta.name }),
 				title,
@@ -148,5 +159,7 @@ export function listAgentSessions(): AgentSessionInfo[] {
 			// not a session directory
 		}
 	}
-	return sessions;
+	return sessions.sort(
+		(left, right) => right.lastActivityAt - left.lastActivityAt || left.sessionId.localeCompare(right.sessionId),
+	);
 }
