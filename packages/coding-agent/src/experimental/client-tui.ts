@@ -93,15 +93,7 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
-type AgentRowState =
-	| "working"
-	| "needs-input"
-	| "needs-instructions"
-	| "finishing"
-	| "stalled"
-	| "done"
-	| "graved"
-	| "failed";
+type AgentRowState = "working" | "needs-input" | "needs-instructions" | "finishing" | "done" | "failed";
 
 type SessionEntry = {
 	readonly sessionId: string;
@@ -115,7 +107,6 @@ type SessionEntry = {
 	readonly name: string | undefined;
 	readonly hasUser: boolean;
 	readonly done: boolean;
-	readonly mtime: number;
 	readonly question: string | undefined;
 };
 
@@ -152,41 +143,12 @@ function extractText(content: unknown): string {
 	return "";
 }
 
-const INTERACTIVE_TOOL_HINTS = ["ask_user_question", "askuser", "question", "request_permission", "confirm", "elicit"];
-const STALL_MS = 10 * 60 * 1000;
-const GRAVED_MS = 24 * 60 * 60 * 1000;
-
-/** True when an assistant entry ends on a tool call that blocks for user input. */
-function hasInteractiveToolCall(record: string): boolean {
-	try {
-		const parsed = JSON.parse(record) as { model?: Array<{ content?: unknown }> };
-		const content = parsed.model?.[0]?.content;
-		if (!Array.isArray(content)) return false;
-		return content.some((part) => {
-			if (part === null || typeof part !== "object") return false;
-			const candidate = part as { name?: unknown; toolName?: unknown };
-			const toolName =
-				typeof candidate.name === "string"
-					? candidate.name
-					: typeof candidate.toolName === "string"
-						? candidate.toolName
-						: "";
-			const lowered = toolName.toLowerCase();
-			return INTERACTIVE_TOOL_HINTS.some((hint) => lowered.includes(hint));
-		});
-	} catch {
-		return false;
-	}
-}
-
 function agentStateLabel(state: AgentRowState): string {
 	if (state === "working") return "working";
 	if (state === "needs-input") return "needs input";
 	if (state === "needs-instructions") return "needs instructions";
 	if (state === "finishing") return "finishing";
-	if (state === "stalled") return "stalled";
 	if (state === "done") return "done";
-	if (state === "graved") return "graved";
 	return "failed";
 }
 
@@ -195,7 +157,7 @@ function agentStateTag(state: AgentRowState): string {
 	const label = agentStateLabel(state).padEnd(18);
 	if (state === "working" || state === "finishing") return theme.fg("accent", label);
 	if (state === "needs-input") return theme.fg("warning", label);
-	if (state === "stalled" || state === "failed") return theme.fg("error", label);
+	if (state === "failed") return theme.fg("error", label);
 	if (state === "done") return theme.fg("success", label);
 	return theme.fg("muted", label);
 }
@@ -679,14 +641,11 @@ export class ExperimentalClientTui implements Component {
 				let activity = "";
 				let entries = 0;
 				let bytes = 0;
-				let mtime = 0;
 				let state: AgentRowState = "needs-instructions";
 				let question: string | undefined;
 				try {
 					const dbPath = join(dir, "session.sqlite");
-					const stat = statSync(dbPath);
-					bytes = stat.size;
-					mtime = stat.mtimeMs;
+					bytes = statSync(dbPath).size;
 					const db = new DatabaseSync(dbPath, { readOnly: true });
 					try {
 						const firstUser = db
@@ -718,19 +677,11 @@ export class ExperimentalClientTui implements Component {
 							.prepare("select status, record from tasks order by id desc limit 1")
 							.get() as unknown as { status?: string; record?: string } | undefined;
 						const status = task?.status;
-						const stalled = Date.now() - mtime > STALL_MS;
-						const graved = Date.now() - mtime > GRAVED_MS;
+						// State is derived only from durable session state: the task record and the pi.question document.
 						if (status === "completing") {
 							state = "finishing";
-						} else if (status === "pending" || status === "running") {
-							state = stalled ? "stalled" : "working";
-						} else if (status === "waiting") {
-							state =
-								lastAssistantRecord !== undefined && hasInteractiveToolCall(lastAssistantRecord)
-									? "needs-input"
-									: stalled
-										? "stalled"
-										: "working";
+						} else if (status === "pending" || status === "running" || status === "waiting") {
+							state = "working";
 						} else if (status === "terminal") {
 							state = /"(?:error|is_error)":\s*(?:"[^"]+"|true)/u.test(task?.record ?? "")
 								? "failed"
@@ -739,7 +690,6 @@ export class ExperimentalClientTui implements Component {
 							state = "needs-instructions";
 						}
 						if (meta.done === true) state = "done";
-						if (graved && (state === "needs-instructions" || state === "done")) state = "graved";
 						// A pending durable question means the session is waiting on the user.
 						const questionRow = db
 							.prepare(
@@ -772,7 +722,6 @@ export class ExperimentalClientTui implements Component {
 					name: meta.name,
 					hasUser: title.length > 0 || meta.name !== undefined,
 					done: meta.done === true,
-					mtime,
 					question,
 				});
 			} catch {
