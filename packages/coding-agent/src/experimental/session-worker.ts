@@ -27,6 +27,7 @@ import {
 	ExecutionEnvs,
 	findInitialAgentModel,
 } from "./durable/harness-setup.ts";
+import { Subagent } from "./durable/subagent.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
@@ -781,11 +782,13 @@ async function createCodingAgentHarness(
 	const envs = new ExecutionEnvs(cwd);
 	let harness: Harness | undefined;
 	try {
+		const registry = createCodingRegistry(settingsManager, cwd);
+		registry.install(Subagent);
 		harness = await Harness.open(
 			await openNodeSqliteStorage(databasePath),
 			{
 				models: modelRuntime,
-				registry: createCodingRegistry(settingsManager, cwd),
+				registry,
 				settings: createHarnessSettings(settingsManager),
 				env: envs.env,
 				onReport: (error) => console.error(error),

@@ -92,9 +92,7 @@ const selectTheme = {
 	noMatch: (text: string) => theme.fg("warning", text),
 };
 
-type AgentRowState = "working" | "needs-input" | "idle" | "completed" | "failed";
-
-const AGENT_STATE_ORDER: readonly AgentRowState[] = ["working", "needs-input", "idle", "completed", "failed"];
+type AgentRowState = "working" | "needs-input" | "needs-instructions" | "stalled" | "done" | "failed";
 
 type SessionEntry = {
 	readonly sessionId: string;
@@ -107,6 +105,8 @@ type SessionEntry = {
 	readonly bytes: number;
 	readonly name: string | undefined;
 	readonly hasUser: boolean;
+	readonly done: boolean;
+	readonly mtime: number;
 };
 
 function shortenPath(path: string): string {
@@ -143,6 +143,7 @@ function extractText(content: unknown): string {
 }
 
 const INTERACTIVE_TOOL_HINTS = ["ask_user_question", "askuser", "question", "request_permission", "confirm", "elicit"];
+const STALL_MS = 10 * 60 * 1000;
 
 /** True when an assistant entry ends on a tool call that blocks for user input. */
 function hasInteractiveToolCall(record: string): boolean {
@@ -167,20 +168,23 @@ function hasInteractiveToolCall(record: string): boolean {
 	}
 }
 
-function agentIcon(state: AgentRowState): string {
-	if (state === "working") return theme.fg("accent", "✽");
-	if (state === "needs-input") return theme.fg("warning", "✻");
-	if (state === "completed") return theme.fg("success", "✻");
-	if (state === "failed") return theme.fg("error", "✗");
-	return theme.fg("muted", "∙");
+function agentStateLabel(state: AgentRowState): string {
+	if (state === "working") return "working";
+	if (state === "needs-input") return "needs input";
+	if (state === "needs-instructions") return "needs instructions";
+	if (state === "stalled") return "stalled";
+	if (state === "done") return "done";
+	return "failed";
 }
 
-function agentStateLabel(state: AgentRowState): string {
-	if (state === "working") return "Working";
-	if (state === "needs-input") return "Needs input";
-	if (state === "completed") return "Completed";
-	if (state === "failed") return "Failed";
-	return "Idle";
+/** Fixed-width, colored state tag shown at the front of every row. */
+function agentStateTag(state: AgentRowState): string {
+	const label = agentStateLabel(state).padEnd(18);
+	if (state === "working") return theme.fg("accent", label);
+	if (state === "needs-input") return theme.fg("warning", label);
+	if (state === "stalled" || state === "failed") return theme.fg("error", label);
+	if (state === "done") return theme.fg("success", label);
+	return theme.fg("muted", label);
 }
 
 function formatBytes(bytes: number): string {
@@ -234,6 +238,16 @@ function newestNonEmptySessionId(): string | undefined {
 	return candidates[0]?.id;
 }
 
+export type SessionDoneListener = (sessionId: string) => void;
+
+const sessionDoneListeners = new Set<SessionDoneListener>();
+
+/** Subscribe to user-confirmed session completion (`/done`). Returns an unsubscribe function. */
+export function onSessionDone(listener: SessionDoneListener): () => void {
+	sessionDoneListeners.add(listener);
+	return () => sessionDoneListeners.delete(listener);
+}
+
 /** Service-only presentation driven by a replicated main-lane snapshot. */
 export class ExperimentalClientTui implements Component {
 	readonly #ui: TUI;
@@ -277,7 +291,6 @@ export class ExperimentalClientTui implements Component {
 	#sessionRenaming = false;
 	#sessionRenameValue = "";
 	#agentDispatch = "";
-	#agentGroupBy: "state" | "directory" = "state";
 	#needsInput = 0;
 	#agentPollTimer: ReturnType<typeof setInterval> | undefined;
 	#documentHidden = false;
@@ -647,15 +660,19 @@ export class ExperimentalClientTui implements Component {
 					createdAt?: number;
 					cwd?: string;
 					name?: string;
+					done?: boolean;
 				};
 				let title = "";
 				let activity = "";
 				let entries = 0;
 				let bytes = 0;
-				let state: AgentRowState = "idle";
+				let mtime = 0;
+				let state: AgentRowState = "needs-instructions";
 				try {
 					const dbPath = join(dir, "session.sqlite");
-					bytes = statSync(dbPath).size;
+					const stat = statSync(dbPath);
+					bytes = stat.size;
+					mtime = stat.mtimeMs;
 					const db = new DatabaseSync(dbPath, { readOnly: true });
 					try {
 						const firstUser = db
@@ -687,22 +704,30 @@ export class ExperimentalClientTui implements Component {
 							.prepare("select status, record from tasks order by id desc limit 1")
 							.get() as unknown as { status?: string; record?: string } | undefined;
 						const status = task?.status;
-						if (status === "pending" || status === "running" || status === "completing") state = "working";
-						else if (status === "waiting")
+						const stalled = Date.now() - mtime > STALL_MS;
+						if (status === "pending" || status === "running" || status === "completing") {
+							state = stalled ? "stalled" : "working";
+						} else if (status === "waiting") {
 							state =
 								lastAssistantRecord !== undefined && hasInteractiveToolCall(lastAssistantRecord)
 									? "needs-input"
-									: "working";
-						else if (status === "terminal")
+									: stalled
+										? "stalled"
+										: "working";
+						} else if (status === "terminal") {
 							state = /"(?:error|is_error)":\s*(?:"[^"]+"|true)/u.test(task?.record ?? "")
 								? "failed"
-								: "completed";
+								: "needs-instructions";
+						} else {
+							state = "needs-instructions";
+						}
 					} finally {
 						db.close();
 					}
 				} catch {
 					// session without a readable database
 				}
+				if (meta.done === true) state = "done";
 				sessions.push({
 					sessionId: id,
 					createdAt: meta.createdAt ?? 0,
@@ -714,6 +739,8 @@ export class ExperimentalClientTui implements Component {
 					bytes,
 					name: meta.name,
 					hasUser: title.length > 0 || meta.name !== undefined,
+					done: meta.done === true,
+					mtime,
 				});
 			} catch {
 				// not a session directory
@@ -750,15 +777,7 @@ export class ExperimentalClientTui implements Component {
 					(session.name?.toLowerCase().includes(query) ?? false),
 			)
 			.filter((session) => session.hasUser || session.sessionId === this.#sessionId)
-			.sort((left, right) =>
-				this.#agentGroupBy === "directory"
-					? left.cwd.localeCompare(right.cwd) ||
-						AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
-						right.createdAt - left.createdAt
-					: AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
-						right.createdAt - left.createdAt ||
-						left.sessionId.localeCompare(right.sessionId),
-			);
+			.sort((left, right) => right.createdAt - left.createdAt || left.sessionId.localeCompare(right.sessionId));
 	}
 
 	#renderSessionOverview(): Container {
@@ -767,42 +786,25 @@ export class ExperimentalClientTui implements Component {
 		const scoped = this.#sessionItems.filter((session) => this.#sessionAll || session.cwd === process.cwd());
 		const needsInput = scoped.filter((session) => session.state === "needs-input").length;
 		const header =
-			theme.fg("accent", "Agent view") +
+			theme.fg("accent", "Agents") +
 			theme.fg("muted", `  ${scoped.length} session${scoped.length === 1 ? "" : "s"}`) +
 			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "") +
-			theme.fg("muted", ` · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
+			theme.fg("muted", ` · newest first · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
 		container.addChild(new Text(header, 1, 1));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
-		let lastGroup: string | undefined;
 		visible.slice(0, 20).forEach((session, index) => {
-			const groupKey = this.#agentGroupBy === "directory" ? session.cwd : session.state;
-			if (groupKey !== lastGroup) {
-				container.addChild(
-					new Text(
-						theme.fg(
-							"muted",
-							this.#agentGroupBy === "directory"
-								? shortenPath(session.cwd) || "?"
-								: agentStateLabel(session.state),
-						),
-						1,
-						1,
-					),
-				);
-				lastGroup = groupKey;
-			}
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
 			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
-			const activity =
-				session.activity.length > 0 && session.activity !== name ? `  ${theme.fg("muted", session.activity)}` : "";
 			const where = theme.fg("muted", shortenPath(session.cwd) || "?");
 			const age = theme.fg("muted", relativeTime(session.createdAt));
+			const activity =
+				session.activity.length > 0 && session.activity !== name ? theme.fg("muted", `  ${session.activity}`) : "";
 			const prefix = selected ? `${theme.fg("accent", "❯")} ` : "  ";
 			container.addChild(
-				new Text(`${prefix}${agentIcon(session.state)} ${selected ? theme.bold(name) : name}${current}`, 1, 0),
+				new Text(`${prefix}${agentStateTag(session.state)} ${selected ? theme.bold(name) : name}${current}`, 1, 0),
 			);
-			container.addChild(new Text(`    ${where} · ${age}${activity}`, 1, 0));
+			container.addChild(new Text(`     ${where} · ${age}${activity}`, 1, 0));
 		});
 		if (this.#sessionRenaming) {
 			container.addChild(new Text(theme.fg("accent", `Rename: ${this.#sessionRenameValue}▏`), 1, 1));
@@ -831,7 +833,7 @@ export class ExperimentalClientTui implements Component {
 			new Text(
 				theme.fg(
 					"muted",
-					"Ctrl+A all/this · Ctrl+S group · ↑/↓ move · Space peek · Enter attach · Ctrl+R rename · Ctrl+X stop · Esc exit",
+					"Ctrl+A all/this · ↑/↓ move · Space peek · Enter attach · type to dispatch · /done · Ctrl+X stop · Esc exit",
 				),
 				1,
 				1,
@@ -865,8 +867,13 @@ export class ExperimentalClientTui implements Component {
 			void this.#confirmSession();
 			return;
 		} else if (data === "\r" || data === "\n") {
-			if (this.#agentDispatch.trim().length > 0) {
-				void this.#dispatchAgent(this.#agentDispatch.trim());
+			const text = this.#agentDispatch.trim();
+			if (text === "/done") {
+				this.#markDone(this.#visibleSessions()[this.#sessionIndex]);
+				return;
+			}
+			if (text.length > 0) {
+				void this.#dispatchAgent(text);
 				return;
 			}
 			void this.#confirmSession();
@@ -877,9 +884,6 @@ export class ExperimentalClientTui implements Component {
 			else this.#screen = "chat";
 		} else if (data === "\u0001") {
 			this.#sessionAll = !this.#sessionAll;
-			this.#sessionIndex = 0;
-		} else if (data === "\u0013") {
-			this.#agentGroupBy = this.#agentGroupBy === "state" ? "directory" : "state";
 			this.#sessionIndex = 0;
 		} else if (data === "\u0012") {
 			const session = this.#visibleSessions()[this.#sessionIndex];
@@ -1050,6 +1054,37 @@ export class ExperimentalClientTui implements Component {
 		}
 		this.#sessionItems = this.#listSessions();
 		if (!this.#closed) this.#rebuild();
+	}
+
+	/** Mark a session done (user-confirmed) and fire the done hook; future memory can key off this. */
+	#markDone(session: SessionEntry | undefined): void {
+		this.#agentDispatch = "";
+		if (session === undefined) {
+			this.#rebuild();
+			return;
+		}
+		const at = Date.now();
+		try {
+			const dir = join(getAgentDir(), "experimental", "sessions", session.sessionId);
+			const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf-8")) as Record<string, unknown>;
+			meta.done = true;
+			meta.doneAt = at;
+			meta.userConfirmed = true;
+			writeFileSync(join(dir, "meta.json"), JSON.stringify(meta));
+			// Durable, observable marker so hooks (e.g. memory) can react to a user-confirmed done.
+			writeFileSync(join(dir, "done.json"), JSON.stringify({ userConfirmed: true, at }));
+		} catch {
+			// ignore mark-done failures
+		}
+		for (const listener of sessionDoneListeners) {
+			try {
+				listener(session.sessionId);
+			} catch {
+				// listener failures must not break the UI
+			}
+		}
+		this.#sessionItems = this.#listSessions();
+		this.#rebuild();
 	}
 
 	#saveSessionName(): void {
