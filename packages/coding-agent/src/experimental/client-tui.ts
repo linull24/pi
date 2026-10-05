@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -1329,6 +1329,23 @@ export class ExperimentalClientTui implements Component {
 		}
 	}
 
+	/** Path of the `hint` role prompt (roles/<prompt> from agent-config). */
+	#hintPromptPath(): string | undefined {
+		try {
+			const config = JSON.parse(readFileSync(join(getAgentDir(), "agent-config.json"), "utf-8")) as {
+				roles?: Record<string, { prompt?: string }>;
+			};
+			const rel = config.roles?.hint?.prompt;
+			if (typeof rel === "string" && rel.length > 0) {
+				const path = join(getAgentDir(), "roles", rel);
+				if (existsSync(path)) return path;
+			}
+		} catch {
+			// no role prompt
+		}
+		return undefined;
+	}
+
 	/** Tab: generate hints once, then cycle them into the composer. */
 	async #tabHint(): Promise<void> {
 		if (this.#hints.length === 0 || this.#hintLoading) {
@@ -1354,29 +1371,25 @@ export class ExperimentalClientTui implements Component {
 		this.#status = "hint: thinking…";
 		this.#rebuild();
 		try {
-			const prompt = [
-				"You are the hint role. Propose the user's most likely next replies for this session.",
-				"Return ONLY a JSON array of up to 3 short strings (ready-to-send user messages, no prose).",
-				"",
-				this.#recentTranscript(),
-			].join("\n");
+			// The instruction lives in the role prompt (roles/hint/prompt.md), not inline here.
+			const transcript = this.#recentTranscript();
+			const promptPath = this.#hintPromptPath();
 			const launcher = join(getAgentDir(), "bin", "pi");
+			const args = [
+				"--mode",
+				"json",
+				"-p",
+				"--no-session",
+				"--no-extensions",
+				"--no-tools",
+				"--model",
+				this.#hintModel(),
+			];
+			if (promptPath !== undefined) args.push("--append-system-prompt", promptPath);
+			args.push(transcript.length > 0 ? transcript : "(no conversation yet)");
 			const out = await new Promise<string>((done) => {
-				execFile(
-					launcher,
-					[
-						"--mode",
-						"json",
-						"-p",
-						"--no-session",
-						"--no-extensions",
-						"--no-tools",
-						"--model",
-						this.#hintModel(),
-						prompt,
-					],
-					{ maxBuffer: 8 * 1024 * 1024 },
-					(error, stdout) => done(error === null ? stdout : ""),
+				execFile(launcher, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout) =>
+					done(error === null ? stdout : ""),
 				);
 			});
 			// Collect assistant text from the JSON stream.
