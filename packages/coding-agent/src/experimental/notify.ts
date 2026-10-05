@@ -32,8 +32,33 @@ export function registerNotificationChannel(channel: NotificationChannel): () =>
 	return () => channels.delete(channel);
 }
 
-/** Emit a structured agent event to every registered channel. */
+/** Default window in which the same (kind, session) is not notified twice. Override with PI_NOTIFY_DEDUPE_MS. */
+const DEFAULT_DEDUPE_MS = 60_000;
+const lastEmitted = new Map<string, number>();
+
+function dedupeWindowMs(): number {
+	const raw = process.env.PI_NOTIFY_DEDUPE_MS;
+	if (raw === undefined) return DEFAULT_DEDUPE_MS;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DEDUPE_MS;
+}
+
+/**
+ * Emit a structured agent event to every registered channel.
+ *
+ * Deduplicated per (kind, sessionId) within a window: several processes register channels and a
+ * session's state can flap, which otherwise turns one event into a stream of notifications. Set
+ * `PI_NOTIFY_DEDUPE_MS=0` to disable.
+ */
 export function emitAgentNotification(event: AgentNotification): void {
+	const window = dedupeWindowMs();
+	if (window > 0) {
+		const key = `${event.kind}:${event.sessionId ?? ""}`;
+		const now = Date.now();
+		const previous = lastEmitted.get(key);
+		if (previous !== undefined && now - previous < window) return;
+		lastEmitted.set(key, now);
+	}
 	for (const channel of channels) {
 		try {
 			channel(event);
@@ -43,8 +68,13 @@ export function emitAgentNotification(event: AgentNotification): void {
 	}
 }
 
-/** Default desktop channel: the community node-notifier library (macOS + Linux/XDG). */
+/**
+ * Default desktop channel: the community node-notifier library (macOS + Linux/XDG).
+ * Disabled with `PI_NO_DESKTOP_NOTIFY=1` — a process whose job is another channel (e.g. captain, which
+ * only speaks QQ) should not also pop a local notification.
+ */
 function desktopChannel(event: AgentNotification): void {
+	if (process.env.PI_NO_DESKTOP_NOTIFY === "1") return;
 	try {
 		notifier.notify({ title: event.title, message: event.message.slice(0, 200) });
 	} catch {
