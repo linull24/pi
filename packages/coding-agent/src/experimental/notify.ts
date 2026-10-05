@@ -75,6 +75,8 @@ export function emitAgentNotification(event: AgentNotification): void {
  */
 function desktopChannel(event: AgentNotification): void {
 	if (process.env.PI_NO_DESKTOP_NOTIFY === "1") return;
+	// Never pop real OS notifications from a test run: unit tests emit synthetic events.
+	if (process.env.VITEST !== undefined || process.env.NODE_ENV === "test") return;
 	try {
 		notifier.notify({ title: event.title, message: event.message.slice(0, 200) });
 	} catch {
