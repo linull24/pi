@@ -106,7 +106,15 @@ type SessionEntry = {
 	readonly entries: number;
 	readonly bytes: number;
 	readonly name: string | undefined;
+	readonly hasUser: boolean;
 };
+
+function shortenPath(path: string): string {
+	const home = process.env.HOME;
+	if (home !== undefined && path === home) return "~";
+	if (home !== undefined && path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
+	return path;
+}
 
 function parseRecordContent(record: string): unknown {
 	try {
@@ -171,6 +179,36 @@ function relativeTime(timestamp: number): string {
 	return `${years} year${years === 1 ? "" : "s"} ago`;
 }
 
+/** Newest session that already has a user prompt (skips empty dispatch leftovers). */
+function newestNonEmptySessionId(): string | undefined {
+	const root = join(getAgentDir(), "experimental", "sessions");
+	let ids: string[];
+	try {
+		ids = readdirSync(root).filter((id) => !id.endsWith(".lock"));
+	} catch {
+		return undefined;
+	}
+	const candidates: Array<{ id: string; createdAt: number }> = [];
+	for (const id of ids) {
+		try {
+			const meta = JSON.parse(readFileSync(join(root, id, "meta.json"), "utf-8")) as { createdAt?: number };
+			const db = new DatabaseSync(join(root, id, "session.sqlite"), { readOnly: true });
+			try {
+				const row = db
+					.prepare("select count(*) as c from entries where json_extract(record, '$.kind') = 'pi.user'")
+					.get() as unknown as { c?: number };
+				if ((row?.c ?? 0) > 0) candidates.push({ id, createdAt: meta.createdAt ?? 0 });
+			} finally {
+				db.close();
+			}
+		} catch {
+			// skip unreadable session
+		}
+	}
+	candidates.sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id));
+	return candidates[0]?.id;
+}
+
 /** Service-only presentation driven by a replicated main-lane snapshot. */
 export class ExperimentalClientTui implements Component {
 	readonly #ui: TUI;
@@ -214,6 +252,9 @@ export class ExperimentalClientTui implements Component {
 	#sessionRenaming = false;
 	#sessionRenameValue = "";
 	#agentDispatch = "";
+	#agentGroupBy: "state" | "directory" = "state";
+	#needsInput = 0;
+	#agentPollTimer: ReturnType<typeof setInterval> | undefined;
 	#documentHidden = false;
 
 	private constructor(
@@ -278,6 +319,7 @@ export class ExperimentalClientTui implements Component {
 			await component.#start(prepared);
 			await component.#openPreparedSession(prepared);
 			if (options.startInAgentsView === true) component.#openSessionOverview();
+			component.#startAgentPolling();
 			return component;
 		} catch (error) {
 			try {
@@ -462,6 +504,10 @@ export class ExperimentalClientTui implements Component {
 
 	async #close(): Promise<void> {
 		this.#closed = true;
+		if (this.#agentPollTimer !== undefined) {
+			clearInterval(this.#agentPollTimer);
+			this.#agentPollTimer = undefined;
+		}
 		this.#completeSelection(undefined);
 		const errors: unknown[] = [];
 		try {
@@ -637,6 +683,7 @@ export class ExperimentalClientTui implements Component {
 					entries,
 					bytes,
 					name: meta.name,
+					hasUser: title.length > 0 || meta.name !== undefined,
 				});
 			} catch {
 				// not a session directory
@@ -656,6 +703,7 @@ export class ExperimentalClientTui implements Component {
 		this.#agentDispatch = "";
 		this.#screen = "sessions";
 		this.#rebuild();
+		void this.#pruneEmptySessions();
 	}
 
 	/** Sessions passing the current-directory / query filters, newest first. */
@@ -671,11 +719,15 @@ export class ExperimentalClientTui implements Component {
 					session.title.toLowerCase().includes(query) ||
 					(session.name?.toLowerCase().includes(query) ?? false),
 			)
-			.sort(
-				(left, right) =>
-					AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
-					right.createdAt - left.createdAt ||
-					left.sessionId.localeCompare(right.sessionId),
+			.filter((session) => session.hasUser || session.sessionId === this.#sessionId)
+			.sort((left, right) =>
+				this.#agentGroupBy === "directory"
+					? left.cwd.localeCompare(right.cwd) ||
+						AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
+						right.createdAt - left.createdAt
+					: AGENT_STATE_ORDER.indexOf(left.state) - AGENT_STATE_ORDER.indexOf(right.state) ||
+						right.createdAt - left.createdAt ||
+						left.sessionId.localeCompare(right.sessionId),
 			);
 	}
 
@@ -688,28 +740,39 @@ export class ExperimentalClientTui implements Component {
 			theme.fg("accent", "Agent view") +
 			theme.fg("muted", `  ${scoped.length} session${scoped.length === 1 ? "" : "s"}`) +
 			(needsInput > 0 ? theme.fg("warning", ` · ${needsInput} need${needsInput === 1 ? "s" : ""} input`) : "") +
-			theme.fg("muted", ` · ${process.cwd()}`);
+			theme.fg("muted", ` · ${this.#sessionAll ? "all projects" : shortenPath(process.cwd())}`);
 		container.addChild(new Text(header, 1, 1));
 		if (visible.length === 0) container.addChild(new Text(theme.fg("muted", "No sessions"), 1, 1));
-		let lastState: AgentRowState | undefined;
+		let lastGroup: string | undefined;
 		visible.slice(0, 20).forEach((session, index) => {
-			if (session.state !== lastState) {
-				container.addChild(new Text(theme.fg("muted", agentStateLabel(session.state)), 1, 1));
-				lastState = session.state;
+			const groupKey = this.#agentGroupBy === "directory" ? session.cwd : session.state;
+			if (groupKey !== lastGroup) {
+				container.addChild(
+					new Text(
+						theme.fg(
+							"muted",
+							this.#agentGroupBy === "directory"
+								? shortenPath(session.cwd) || "?"
+								: agentStateLabel(session.state),
+						),
+						1,
+						1,
+					),
+				);
+				lastGroup = groupKey;
 			}
 			const selected = index === this.#sessionIndex;
 			const name = this.#sessionName(session);
-			const current = session.sessionId === this.#sessionId ? theme.fg("muted", " (current)") : "";
-			const activity = session.activity.length > 0 ? `  ${theme.fg("muted", session.activity)}` : "";
-			const age = theme.fg("muted", `  ${relativeTime(session.createdAt)}`);
+			const current = session.sessionId === this.#sessionId ? theme.fg("accent", " ◂ current") : "";
+			const activity =
+				session.activity.length > 0 && session.activity !== name ? `  ${theme.fg("muted", session.activity)}` : "";
+			const where = theme.fg("muted", shortenPath(session.cwd) || "?");
+			const age = theme.fg("muted", relativeTime(session.createdAt));
 			const prefix = selected ? `${theme.fg("accent", "❯")} ` : "  ";
 			container.addChild(
-				new Text(
-					`${prefix}${agentIcon(session.state)} ${selected ? theme.bold(name) : name}${current}${activity}${age}`,
-					1,
-					0,
-				),
+				new Text(`${prefix}${agentIcon(session.state)} ${selected ? theme.bold(name) : name}${current}`, 1, 0),
 			);
+			container.addChild(new Text(`    ${where} · ${age}${activity}`, 1, 0));
 		});
 		if (this.#sessionRenaming) {
 			container.addChild(new Text(theme.fg("accent", `Rename: ${this.#sessionRenameValue}▏`), 1, 1));
@@ -736,7 +799,10 @@ export class ExperimentalClientTui implements Component {
 		container.addChild(new Text(`${theme.fg("accent", "❯")} ${composer}`, 1, 1));
 		container.addChild(
 			new Text(
-				theme.fg("muted", "↑/↓ move · Space peek · Enter attach · Ctrl+R rename · Ctrl+X stop · Esc exit"),
+				theme.fg(
+					"muted",
+					"Ctrl+A all/this · Ctrl+S group · ↑/↓ move · Space peek · Enter attach · Ctrl+R rename · Ctrl+X stop · Esc exit",
+				),
 				1,
 				1,
 			),
@@ -781,6 +847,9 @@ export class ExperimentalClientTui implements Component {
 			else this.#screen = "chat";
 		} else if (data === "\u0001") {
 			this.#sessionAll = !this.#sessionAll;
+			this.#sessionIndex = 0;
+		} else if (data === "\u0013") {
+			this.#agentGroupBy = this.#agentGroupBy === "state" ? "directory" : "state";
 			this.#sessionIndex = 0;
 		} else if (data === "\u0012") {
 			const session = this.#visibleSessions()[this.#sessionIndex];
@@ -898,6 +967,59 @@ export class ExperimentalClientTui implements Component {
 		}
 		this.#sessionItems = this.#listSessions();
 		this.#rebuild();
+	}
+
+	/** Poll session state in the background so the footer can show how many agents need input. */
+	#startAgentPolling(): void {
+		if (this.#agentPollTimer !== undefined) return;
+		const tick = (): void => {
+			try {
+				const items = this.#listSessions();
+				const needs = items.filter((session) => session.state === "needs-input").length;
+				if (needs !== this.#needsInput) {
+					this.#needsInput = needs;
+					this.#sessionItems = items;
+					if (!this.#closed) this.#rebuild();
+				}
+			} catch {
+				// best-effort polling
+			}
+		};
+		tick();
+		this.#agentPollTimer = setInterval(tick, 10_000);
+		this.#agentPollTimer.unref();
+	}
+
+	/** Remove sessions that never received a prompt (empty idle sessions) to free resources. */
+	async #pruneEmptySessions(): Promise<void> {
+		const empties = this.#sessionItems.filter((session) => !session.hasUser && session.sessionId !== this.#sessionId);
+		if (empties.length === 0) return;
+		const server = this.#servers[0];
+		if (server === undefined) return;
+		try {
+			const serverServices = server.server.open({
+				services: [SessionManagement],
+				assertAccess() {},
+				onError() {},
+			});
+			try {
+				await serverServices.ready(BACKGROUND_CONTEXT);
+				const management = serverServices.use(SessionManagement);
+				for (const session of empties) {
+					try {
+						await management.remove(session.sessionId, BACKGROUND_CONTEXT);
+					} catch {
+						// already gone or in use
+					}
+				}
+			} finally {
+				await serverServices.dispose(BACKGROUND_CONTEXT);
+			}
+		} catch {
+			// pruning is best-effort
+		}
+		this.#sessionItems = this.#listSessions();
+		if (!this.#closed) this.#rebuild();
 	}
 
 	#saveSessionName(): void {
@@ -1135,7 +1257,8 @@ export class ExperimentalClientTui implements Component {
 		if (!view) return "/model · /thinking · /compact · /reload";
 		const agent = (view.docs["pi.agent"] ?? {}) as AgentState;
 		const model = agent.model === undefined ? "no model" : `${agent.model.provider}/${agent.model.modelId}`;
-		return `${model} · thinking:${agent.thinkingLevel ?? "off"} · ${view.entries.length} entries · /model · /thinking · /compact · /reload`;
+		const agentsHint = this.#needsInput > 0 ? `← ${this.#needsInput} agents` : "← agents";
+		return `${model} · thinking:${agent.thinkingLevel ?? "off"} · ${view.entries.length} entries · ${agentsHint} · /model · /thinking · /compact · /reload`;
 	}
 }
 
@@ -1240,14 +1363,20 @@ async function prepareClientSession(
 export async function runClientTui(command: ClientCommand, options: RunClientTuiOptions = {}): Promise<void> {
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
-	// `pi agents` opens the Agent View without creating an empty session; attach to the newest.
-	const baseCommand: ClientCommand =
-		options.startInAgentsView === true &&
-		command.sessionId === undefined &&
-		command.continue !== true &&
-		command.resume !== true
-			? { ...command, continue: true }
-			: command;
+	// `pi agents` opens the Agent View without creating an empty session; attach to the newest
+	// non-empty session so no empty leftover is kept alive by the current marker.
+	const baseCommand: ClientCommand = (() => {
+		if (
+			options.startInAgentsView !== true ||
+			command.sessionId !== undefined ||
+			command.continue === true ||
+			command.resume === true
+		) {
+			return command;
+		}
+		const existing = newestNonEmptySessionId();
+		return existing === undefined ? { ...command, continue: true } : { ...command, sessionId: existing };
+	})();
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
