@@ -10,8 +10,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { captainConfigFromEnv, startCaptain } from "./captain.ts";
+import { captainConfigFromEnv, startCaptain, startCaptainStateWatch } from "./captain.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
+import { emitAgentNotification } from "./notify.ts";
 import { AgentController } from "./services/agent-controller.ts";
 import { Questions } from "./services/questions.ts";
 import { createSessionChannelOpener, createSideChannelDeps } from "./side-channel-sessions.ts";
@@ -48,6 +49,40 @@ export function newestSessionFromDisk(): string | undefined {
 	}
 	candidates.sort((left, right) => right.at - left.at || left.id.localeCompare(right.id));
 	return candidates[0]?.id;
+}
+
+/**
+ * Read a session's durable state from its sqlite (task status + pending `pi.question`). Mirrors the
+ * client's mapping so captain can watch the same states from its own process.
+ */
+export function readSessionState(sessionId: string, agentDir?: string): string {
+	const dir = agentDir ?? process.env.PI_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+	const dbPath = path.join(dir, "experimental", "sessions", sessionId, "session.sqlite");
+	const db = new DatabaseSync(dbPath, { readOnly: true });
+	try {
+		let state = "needs-instructions";
+		const task = db.prepare("select status, record from tasks order by id desc limit 1").get() as unknown as
+			| { status?: string; record?: string }
+			| undefined;
+		if (task?.status === "completing") state = "finishing";
+		else if (task?.status === "pending" || task?.status === "running" || task?.status === "waiting")
+			state = "working";
+		else if (task?.status === "terminal") {
+			state = /"(?:error|is_error)":\s*(?:"[^"]+"|true)/u.test(task.record ?? "") ? "failed" : "needs-instructions";
+		}
+		const question = db
+			.prepare(
+				"select r.content from document_revisions r join documents d on d.id = r.document_id where d.kind = '\"pi.question\"' order by r.seq desc limit 1",
+			)
+			.get() as unknown as { content?: string } | undefined;
+		if (question?.content !== undefined) {
+			const doc = JSON.parse(question.content) as { status?: string };
+			if (doc.status === "pending") state = "needs-input";
+		}
+		return state;
+	} finally {
+		db.close();
+	}
 }
 
 /**
@@ -88,8 +123,25 @@ export async function runCaptain(
 		async () => false,
 	);
 	const stop = startCaptain(config, { sideChannel: createSideChannelDeps(opener), log });
+	const stopWatch = startCaptainStateWatch({
+		readState: () => readSessionState(sessionId),
+		onEvent: (kind) =>
+			emitAgentNotification({
+				kind,
+				title: "captain",
+				message:
+					kind === "needs-input"
+						? "A session needs your input"
+						: kind === "failed"
+							? "A session failed"
+							: "A session finished",
+				sessionId,
+			}),
+		log,
+	});
 
 	const shutdown = async (): Promise<void> => {
+		stopWatch();
 		stop();
 		await runtime.dispose();
 	};

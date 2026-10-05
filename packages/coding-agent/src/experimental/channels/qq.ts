@@ -186,10 +186,16 @@ export function createQqBotAdapter(options: QqBotOptions): AgentChannelAdapter {
 			const openid = options.defaultOpenid;
 			if (openid === undefined || openid.length === 0) return;
 			try {
-				if (heartbeat === undefined) return; // not connected yet: drop rather than queue forever
+				if (heartbeat === undefined) {
+					log(`QQ not connected; dropped ${notification.kind}`);
+					return;
+				}
 				msgSeq += 1;
 				const reply = buildC2CReply(openid, `${notification.title}\n${notification.message}`, msgSeq);
-				void api("POST", reply.path, reply.body).catch((error) => log(`QQ send failed: ${String(error)}`));
+				void api("POST", reply.path, reply.body).then(
+					() => log(`QQ sent ${notification.kind}`),
+					(error) => log(`QQ send failed: ${String(error)}`),
+				);
 			} catch {
 				// a failed send must never break the emitter
 			}

@@ -88,3 +88,58 @@ export function startCaptain(
 		stopChannelAdapters();
 	};
 }
+
+/** A captain state transition worth pushing out to IM. */
+export type CaptainEventKind = "needs-input" | "finished" | "failed";
+
+/**
+ * Map a session-state transition to an outbound event, or undefined when nothing should be sent.
+ * `needs-input` fires on entry; `finished` on leaving an active state for `needs-instructions`/`done`;
+ * `failed` on entry. Pure so the rules can be tested without a daemon.
+ */
+export function transitionEvent(previous: string | undefined, next: string): CaptainEventKind | undefined {
+	if (previous === next) return undefined;
+	if (next === "needs-input") return "needs-input";
+	if (next === "failed") return "failed";
+	if (next === "done") return "finished";
+	const wasActive = previous === "working" || previous === "finishing";
+	if (next === "needs-instructions" && wasActive) return "finished";
+	return undefined;
+}
+
+/**
+ * captain's outbound watch: poll the attached session's state and emit on transitions. Notifications
+ * are produced inside the daemon worker (request_input / the client poller), so captain — a separate
+ * process — watches the durable session itself and pushes the events out to IM.
+ */
+export function startCaptainStateWatch(options: {
+	readState(): string;
+	intervalMs?: number;
+	onEvent(kind: CaptainEventKind): void;
+	log?(message: string): void;
+}): () => void {
+	const interval = options.intervalMs ?? 4_000;
+	let previous: string | undefined;
+	const tick = (): void => {
+		let next: string;
+		try {
+			next = options.readState();
+		} catch (error) {
+			options.log?.(`[captain] state read failed: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		const kind = transitionEvent(previous, next);
+		previous = next;
+		if (kind !== undefined) {
+			try {
+				options.onEvent(kind);
+			} catch (error) {
+				options.log?.(`[captain] notify failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+	};
+	tick();
+	const timer = setInterval(tick, interval);
+	timer.unref?.();
+	return () => clearInterval(timer);
+}

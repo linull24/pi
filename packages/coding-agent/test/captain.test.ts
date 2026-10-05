@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { CAPTAIN_DEFAULT_MODEL, captainConfigFromEnv, startCaptain } from "../src/experimental/captain.ts";
+import {
+	CAPTAIN_DEFAULT_MODEL,
+	captainConfigFromEnv,
+	startCaptain,
+	startCaptainStateWatch,
+	transitionEvent,
+} from "../src/experimental/captain.ts";
 import { emitAgentNotification } from "../src/experimental/notify.ts";
 import type { AgentChannelAdapter, AgentChannelMessage, SideChannelDeps } from "../src/experimental/side-channel.ts";
 
@@ -84,5 +90,30 @@ describe("startCaptain", () => {
 		} finally {
 			stop();
 		}
+	});
+});
+
+describe("outbound transitions", () => {
+	it("maps state transitions to events", () => {
+		expect(transitionEvent("working", "needs-input")).toBe("needs-input");
+		expect(transitionEvent("working", "needs-instructions")).toBe("finished");
+		expect(transitionEvent("working", "done")).toBe("finished");
+		expect(transitionEvent("working", "failed")).toBe("failed");
+		expect(transitionEvent("needs-instructions", "needs-instructions")).toBeUndefined();
+		expect(transitionEvent(undefined, "needs-instructions")).toBeUndefined();
+	});
+
+	it("emits once per transition while polling", async () => {
+		const seen: string[] = [];
+		const states = ["needs-instructions", "working", "needs-input"];
+		let i = 0;
+		const stop = startCaptainStateWatch({
+			readState: () => states[Math.min(i++, states.length - 1)]!,
+			intervalMs: 5,
+			onEvent: (kind) => seen.push(kind),
+		});
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		stop();
+		expect(seen).toEqual(["needs-input"]);
 	});
 });
