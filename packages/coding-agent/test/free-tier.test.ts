@@ -4,6 +4,8 @@ import {
 	type Candidate,
 	costOfBudget,
 	OBJECTIVES,
+	objectiveOf,
+	registryCandidates,
 	selectCandidate,
 	shouldConserve,
 } from "../src/experimental/free-tier.ts";
@@ -81,5 +83,69 @@ describe("selectCandidate", () => {
 	it("after escalation to 'any', the metered strong model is chosen", () => {
 		const metered = candidate({ provider: "openrouter", quality: "strong", budget: "metered" });
 		expect(selectCandidate([metered], OBJECTIVES.mustWork).chosen?.provider).toBe("openrouter");
+	});
+});
+
+describe("registry", () => {
+	const registry = {
+		sources: {
+			deepseek: {
+				provider: "deepseek",
+				budget: "daily-free" as const,
+				quality: "strong" as const,
+				cache: { cheap: true },
+			},
+			openrouter: {
+				provider: "openrouter",
+				budget: "metered" as const,
+				quality: "usable" as const,
+				cost: "high" as const,
+			},
+		},
+		models: [
+			{ provider: "deepseek", model: "deepseek-flash" },
+			{ provider: "openrouter", model: "x:free", cost: "zero" as const },
+		],
+		objectives: { daily: { floor: "usable" as const, ceiling: "free" as const, prefer: "cost" as const } },
+	};
+
+	it("inherits source defaults and lets a model override them", () => {
+		const candidates = registryCandidates(registry);
+		expect(candidates).toHaveLength(2);
+		const ds = candidates.find((c) => c.provider === "deepseek");
+		expect(ds).toMatchObject({ quality: "strong", budget: "daily-free", cacheReadCheap: true });
+		// openrouter is metered/high by default for this source, but the :free id overrides cost to zero
+		const or = candidates.find((c) => c.provider === "openrouter");
+		expect(or).toMatchObject({ cost: "zero", budget: "metered" });
+	});
+
+	it("selects per objective: free-only picks deepseek, must-work may pick openrouter", () => {
+		const candidates = registryCandidates(registry);
+		expect(selectCandidate(candidates, objectiveOf(registry, "daily")).chosen?.provider).toBe("deepseek");
+		expect(selectCandidate(candidates, OBJECTIVES.mustWork).chosen?.provider).toBe("deepseek");
+	});
+});
+
+describe("registry with two sources on one provider", () => {
+	it("keeps a model on its exact source key, not a later same-provider source", () => {
+		const twoSources = {
+			sources: {
+				deepseek: {
+					provider: "deepseek",
+					budget: "metered" as const,
+					quality: "strong" as const,
+					cost: "low" as const,
+				},
+				"deepseek-shanghai": {
+					provider: "deepseek",
+					budget: "daily-free" as const,
+					quality: "strong" as const,
+					available: false,
+				},
+			},
+			models: [{ provider: "deepseek", model: "deepseek-flash" }],
+		};
+		const [c] = registryCandidates(twoSources);
+		expect(c).toMatchObject({ budget: "metered", cost: "low", available: undefined });
 	});
 });

@@ -135,3 +135,70 @@ export const OBJECTIVES = {
 	/** Real work: it must work, cost is secondary. */
 	mustWork: { floor: "strong", ceiling: "any", prefer: "quality" } as Objective,
 } as const;
+
+// ── Registry (data → candidates) ────────────────────────────────────────────────────────────────
+
+export interface RegistrySource {
+	readonly provider: string;
+	readonly budget: BudgetType;
+	readonly quality: Quality;
+	readonly cost?: CostClass;
+	readonly available?: boolean;
+	readonly softCap?: boolean;
+	readonly quota?: { readonly period: string; readonly amount?: string; readonly left?: number };
+	readonly cache?: { readonly cheap?: boolean };
+	readonly note?: string;
+}
+
+export interface RegistryModel {
+	readonly provider: string;
+	readonly model: string;
+	readonly source?: string;
+	readonly quality?: Quality;
+	readonly budget?: BudgetType;
+	readonly cost?: CostClass;
+	readonly available?: boolean;
+}
+
+export interface Registry {
+	readonly sources: Readonly<Record<string, RegistrySource>>;
+	readonly models?: readonly RegistryModel[];
+	readonly objectives?: Readonly<Record<string, Objective>>;
+}
+
+/**
+ * Flatten a registry into candidates. A model inherits its source's defaults (looked up by the
+ * registry key that names the provider, else by the provider itself) and may override them.
+ */
+export function registryCandidates(registry: Registry): Candidate[] {
+	// Provider -> source is only a *default*: several sources can share one provider (the official
+	// API vs a research-institute program), so the first declaration wins and an exact source key or
+	// an explicit model.source always takes precedence.
+	const byProvider = new Map<string, RegistrySource>();
+	for (const source of Object.values(registry.sources)) {
+		if (!byProvider.has(source.provider)) byProvider.set(source.provider, source);
+	}
+	const out: Candidate[] = [];
+	for (const model of registry.models ?? []) {
+		const source =
+			(model.source === undefined ? undefined : (registry.sources[model.source] ?? byProvider.get(model.source))) ??
+			registry.sources[model.provider] ??
+			byProvider.get(model.provider);
+		if (source === undefined) continue;
+		out.push({
+			provider: model.provider,
+			model: model.model,
+			source: model.source ?? source.provider,
+			quality: model.quality ?? source.quality,
+			budget: model.budget ?? source.budget,
+			...((model.cost ?? source.cost) === undefined ? {} : { cost: (model.cost ?? source.cost) as CostClass }),
+			available: model.available ?? source.available,
+			...(source.cache?.cheap === undefined ? {} : { cacheReadCheap: source.cache.cheap }),
+		});
+	}
+	return out;
+}
+
+export function objectiveOf(registry: Registry, role: string, fallback: Objective = OBJECTIVES.routine): Objective {
+	return registry.objectives?.[role] ?? fallback;
+}
